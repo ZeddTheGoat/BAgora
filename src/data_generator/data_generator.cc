@@ -350,8 +350,8 @@ size_t DataGenerator::DecodeBroadcastSlots(
   auto* bcast_buff_complex = reinterpret_cast<arma::cx_float*>(bcast_fft_buff);
 
   const size_t sc_num = cfg->GetOFDMCtrlNum();
-  const size_t ctrl_sc_num =
-      cfg->BcLdpcConfig().NumCbCodewLen() / cfg->BcModOrderBits();
+  const size_t ctrl_sc_num = cfg->MacParams().BcLdpcConfig().NumCbCodewLen() /
+                             cfg->MacParams().BcModOrderBits();
   std::vector<arma::cx_float> csi_buff(cfg->OfdmDataNum());
   arma::cx_float* eq_buff =
       static_cast<arma::cx_float*>(Agora_memory::PaddedAlignedAlloc(
@@ -382,18 +382,20 @@ size_t DataGenerator::DecodeBroadcastSlots(
           exp(arma::cx_float(0, -phase_shift));
     }
   }
-  int8_t* demod_buff_ptr = static_cast<int8_t*>(
-      Agora_memory::PaddedAlignedAlloc(Agora_memory::Alignment_t::kAlign64,
-                                       cfg->BcModOrderBits() * ctrl_sc_num));
+  int8_t* demod_buff_ptr =
+      static_cast<int8_t*>(Agora_memory::PaddedAlignedAlloc(
+          Agora_memory::Alignment_t::kAlign64,
+          cfg->MacParams().BcModOrderBits() * ctrl_sc_num));
   Demodulate(reinterpret_cast<float*>(&eq_buff[0]), demod_buff_ptr,
-             2 * ctrl_sc_num, cfg->BcModOrderBits(), false);
+             2 * ctrl_sc_num, cfg->MacParams().BcModOrderBits(), false);
 
-  const int num_bcast_bytes = BitsToBytes(cfg->BcLdpcConfig().NumCbLen());
+  const int num_bcast_bytes =
+      BitsToBytes(cfg->MacParams().BcLdpcConfig().NumCbLen());
   std::vector<uint8_t> decode_buff(num_bcast_bytes, 0u);
 
   DataGenerator::GetDecodedData(demod_buff_ptr, &decode_buff.at(0),
-                                cfg->BcLdpcConfig(), num_bcast_bytes,
-                                cfg->ScrambleEnabled());
+                                cfg->MacParams().BcLdpcConfig(),
+                                num_bcast_bytes, cfg->ScrambleEnabled());
   FreeBuffer1d(&bcast_fft_buff);
   FreeBuffer1d(&eq_buff);
   FreeBuffer1d(&demod_buff_ptr);
@@ -412,23 +414,23 @@ void DataGenerator::GenBroadcastSlots(
   assert(bcast_iq_samps.size() == cfg->Frame().NumDlControlSyms());
   const size_t start_tsc = GetTime::WorkerRdtsc();
 
-  int num_bcast_bytes = BitsToBytes(cfg->BcLdpcConfig().NumCbLen());
+  int num_bcast_bytes = BitsToBytes(cfg->MacParams().BcLdpcConfig().NumCbLen());
   std::vector<int8_t> bcast_bits_buffer(num_bcast_bytes, 0);
 
   Table<complex_float> dl_bcast_mod_table;
-  InitModulationTable(dl_bcast_mod_table, cfg->BcModOrderBits());
+  InitModulationTable(dl_bcast_mod_table, cfg->MacParams().BcModOrderBits());
 
   for (size_t i = 0; i < cfg->Frame().NumDlControlSyms(); i++) {
     std::memcpy(bcast_bits_buffer.data(), ctrl_msg.data(), sizeof(size_t));
 
     const auto coded_bits_ptr = DataGenerator::GenCodeblock(
-        cfg->BcLdpcConfig(), &bcast_bits_buffer.at(0), num_bcast_bytes,
-        cfg->ScrambleEnabled());
+        cfg->MacParams().BcLdpcConfig(), &bcast_bits_buffer.at(0),
+        num_bcast_bytes, cfg->ScrambleEnabled());
 
-    auto modulated_vector =
-        DataGenerator::GetModulation(&coded_bits_ptr[0], dl_bcast_mod_table,
-                                     cfg->BcLdpcConfig().NumCbCodewLen(),
-                                     cfg->OfdmDataNum(), cfg->BcModOrderBits());
+    auto modulated_vector = DataGenerator::GetModulation(
+        &coded_bits_ptr[0], dl_bcast_mod_table,
+        cfg->MacParams().BcLdpcConfig().NumCbCodewLen(), cfg->OfdmDataNum(),
+        cfg->MacParams().BcModOrderBits());
     auto mapped_symbol = DataGenerator::MapOFDMSymbol(
         cfg, modulated_vector, cfg->Pilots(), SymbolType::kControl);
     auto ofdm_symbol = DataGenerator::BinForIfft(cfg, mapped_symbol, true);
@@ -453,26 +455,30 @@ void DataGenerator::GenerateUlTxTestVectors(Config* const cfg) {
     std::filesystem::create_directory(kExperimentFilepath);
   }
   std::unique_ptr<DoCRC> crc_obj = std::make_unique<DoCRC>();
-  const size_t ul_cb_bytes = cfg->NumBytesPerCb(Direction::kUplink);
-  LDPCconfig ul_ldpc_config = cfg->LdpcConfig(Direction::kUplink);
-  const size_t num_ul_mac_bytes = cfg->MacBytesNumPerframe(Direction::kUplink);
+  const size_t ul_cb_bytes = cfg->MacParams().NumBytesPerCb(Direction::kUplink);
+  LDPCconfig ul_ldpc_config = cfg->MacParams().LdpcConfig(Direction::kUplink);
+  const size_t num_ul_mac_bytes =
+      cfg->MacParams().MacBytesNumPerframe(Direction::kUplink);
   if (num_ul_mac_bytes > 0) {
     std::vector<std::vector<int8_t>> ul_mac_info(cfg->UeAntNum());
     AGORA_LOG_INFO("Total number of uplink MAC bytes: %zu\n", num_ul_mac_bytes);
     for (size_t ue_id = 0; ue_id < cfg->UeAntNum(); ue_id++) {
       ul_mac_info.at(ue_id).resize(num_ul_mac_bytes);
       for (size_t pkt_id = 0;
-           pkt_id < cfg->MacPacketsPerframe(Direction::kUplink); pkt_id++) {
-        size_t pkt_offset = pkt_id * cfg->MacPacketLength(Direction::kUplink);
+           pkt_id < cfg->MacParams().MacPacketsPerframe(Direction::kUplink);
+           pkt_id++) {
+        size_t pkt_offset =
+            pkt_id * cfg->MacParams().MacPacketLength(Direction::kUplink);
         auto* pkt = reinterpret_cast<MacPacketPacked*>(
             &ul_mac_info.at(ue_id).at(pkt_offset));
 
         pkt->Set(0, pkt_id, ue_id,
-                 cfg->MacPayloadMaxLength(Direction::kUplink));
+                 cfg->MacParams().MacPayloadMaxLength(Direction::kUplink));
         DataGenerator::GenMacRandomBits(pkt);
         pkt->Crc((uint16_t)(
             crc_obj->CalculateCrc24(
-                pkt->Data(), cfg->MacPayloadMaxLength(Direction::kUplink)) &
+                pkt->Data(),
+                cfg->MacParams().MacPayloadMaxLength(Direction::kUplink)) &
             0xFFFF));
       }
     }
@@ -524,9 +530,10 @@ void DataGenerator::GenerateUlTxTestVectors(Config* const cfg) {
       ul_modulated_codewords.at(i).resize(cfg->OfdmDataNum());
       auto ofdm_symbol = DataGenerator::GetModulation(
           &ul_encoded_codewords.at(i)[0], &ul_modulated_codewords.at(i).at(0),
-          cfg->ModTable(Direction::kUplink),
-          cfg->LdpcConfig(Direction::kUplink).NumCbCodewLen(),
-          cfg->OfdmDataNum(), cfg->ModOrderBits(Direction::kUplink));
+          cfg->MacParams().ModTable(Direction::kUplink),
+          cfg->MacParams().LdpcConfig(Direction::kUplink).NumCbCodewLen(),
+          cfg->OfdmDataNum(),
+          cfg->MacParams().ModOrderBits(Direction::kUplink));
       ul_modulated_symbols.at(i) = DataGenerator::MapOFDMSymbol(
           cfg, ofdm_symbol, nullptr, SymbolType::kUL);
     }
@@ -588,26 +595,31 @@ void DataGenerator::GenerateDlTxTestVectors(Config* const cfg,
   }
   assert(dmrs.Dim1() == cfg->UeAntNum());
   std::unique_ptr<DoCRC> crc_obj = std::make_unique<DoCRC>();
-  const LDPCconfig dl_ldpc_config = cfg->LdpcConfig(Direction::kDownlink);
-  const size_t dl_cb_bytes = cfg->NumBytesPerCb(Direction::kDownlink);
+  const LDPCconfig dl_ldpc_config =
+      cfg->MacParams().LdpcConfig(Direction::kDownlink);
+  const size_t dl_cb_bytes =
+      cfg->MacParams().NumBytesPerCb(Direction::kDownlink);
   const size_t num_dl_mac_bytes =
-      cfg->MacBytesNumPerframe(Direction::kDownlink);
+      cfg->MacParams().MacBytesNumPerframe(Direction::kDownlink);
   std::vector<std::vector<int8_t>> dl_mac_info(cfg->UeAntNum());
   if (num_dl_mac_bytes > 0) {
     for (size_t ue_id = 0; ue_id < cfg->UeAntNum(); ue_id++) {
       dl_mac_info[ue_id].resize(num_dl_mac_bytes);
       for (size_t pkt_id = 0;
-           pkt_id < cfg->MacPacketsPerframe(Direction::kDownlink); pkt_id++) {
-        size_t pkt_offset = pkt_id * cfg->MacPacketLength(Direction::kDownlink);
+           pkt_id < cfg->MacParams().MacPacketsPerframe(Direction::kDownlink);
+           pkt_id++) {
+        size_t pkt_offset =
+            pkt_id * cfg->MacParams().MacPacketLength(Direction::kDownlink);
         auto* pkt = reinterpret_cast<MacPacketPacked*>(
             &dl_mac_info.at(ue_id).at(pkt_offset));
 
         pkt->Set(0, pkt_id, ue_id,
-                 cfg->MacPayloadMaxLength(Direction::kDownlink));
+                 cfg->MacParams().MacPayloadMaxLength(Direction::kDownlink));
         DataGenerator::GenMacRandomBits(pkt);
         pkt->Crc((uint16_t)(
             crc_obj->CalculateCrc24(
-                pkt->Data(), cfg->MacPayloadMaxLength(Direction::kDownlink)) &
+                pkt->Data(),
+                cfg->MacParams().MacPayloadMaxLength(Direction::kDownlink)) &
             0xFFFF));
       }
     }
@@ -661,9 +673,10 @@ void DataGenerator::GenerateDlTxTestVectors(Config* const cfg,
       dl_modulated_codewords.at(i).resize(cfg->OfdmDataNum());
       auto ofdm_symbol = DataGenerator::GetModulation(
           &dl_encoded_codewords.at(i)[0], &dl_modulated_codewords.at(i)[0],
-          cfg->ModTable(Direction::kDownlink),
-          cfg->LdpcConfig(Direction::kDownlink).NumCbCodewLen(),
-          cfg->OfdmDataNum(), cfg->ModOrderBits(Direction::kDownlink));
+          cfg->MacParams().ModTable(Direction::kDownlink),
+          cfg->MacParams().LdpcConfig(Direction::kDownlink).NumCbCodewLen(),
+          cfg->OfdmDataNum(),
+          cfg->MacParams().ModOrderBits(Direction::kDownlink));
       dl_modulated_symbols.at(i) = DataGenerator::MapOFDMSymbol(
           cfg, ofdm_symbol, dmrs[ue_id], SymbolType::kDL);
     }
@@ -712,6 +725,71 @@ void DataGenerator::GenerateDlTxTestVectors(Config* const cfg,
                                tx_data_symbols.at(i).data(),
                                i != 0);  //Do not append in the first write
       }
+    }
+  }
+}
+
+void DataGenerator::WriteUlScDataToFile(
+    const Config* const cfg, const std::string& directory,
+    const std::vector<std::vector<int8_t>>& ul_encoded_codewords) {
+  std::vector<std::vector<std::vector<std::vector<std::vector<uint8_t>>>>>
+      ul_ofdm_data(cfg->UeNum(),
+                   std::vector<std::vector<std::vector<std::vector<uint8_t>>>>(
+                       kOutputFrameNum,
+                       std::vector<std::vector<std::vector<uint8_t>>>(
+                           cfg->Frame().NumULSyms(),
+                           std::vector<std::vector<uint8_t>>(
+                               cfg->NumUeChannels(),
+                               std::vector<uint8_t>(cfg->OfdmDataNum())))));
+  size_t num_ul_codeblocks = ul_encoded_codewords.size();
+  for (size_t n = 0; n < num_ul_codeblocks; n++) {
+    const size_t cl_sdr = (n % cfg->UeNum());
+    const size_t ul_slot =
+        (n / cfg->UeAntNum()) + cfg->Frame().ClientUlPilotSymbols();
+    const size_t cl_sdr_ch = (n % cfg->UeAntNum()) % cfg->NumUeChannels();
+    std::vector<uint8_t> odfm_symbol(cfg->OfdmDataNum());
+    AdaptBitsForMod(
+        reinterpret_cast<const uint8_t*>(ul_encoded_codewords.at(n).data()),
+        odfm_symbol.data(),
+        cfg->MacParams().LdpcConfig(Direction::kUplink).NumEncodedBytes(),
+        cfg->MacParams().ModOrderBits(Direction::kUplink));
+    for (size_t f = 0; f < kOutputFrameNum; f++) {
+      ul_ofdm_data.at(cl_sdr).at(f).at(ul_slot).at(cl_sdr_ch) = odfm_symbol;
+    }
+  }
+  for (size_t i = 0; i < cfg->UeNum(); i++) {
+    const std::string filename_input =
+        directory + kUlModDataPrefix +
+        cfg->MacParams().Modulation(Direction::kUplink) + "_" +
+        std::to_string(cfg->OfdmDataNum()) + "_" +
+        std::to_string(cfg->OfdmCaNum()) + "_" +
+        std::to_string(kOfdmSymbolPerSlot) + "_" +
+        std::to_string(cfg->Frame().NumULSyms()) + "_" +
+        std::to_string(kOutputFrameNum) + "_" + cfg->UeChannel() + "_" +
+        std::to_string(i) + ".bin";
+    AGORA_LOG_INFO("Saving uplink sc bits to %s\n", filename_input.c_str());
+    auto* fp_tx_b = std::fopen(filename_input.c_str(), "wb");
+    if (fp_tx_b == nullptr) {
+      throw std::runtime_error(
+          "DataGenerator: Failed to create ul sc bits file");
+    }
+    for (size_t f = 0; f < kOutputFrameNum; f++) {
+      for (size_t u = 0; u < cfg->Frame().NumULSyms(); u++) {
+        for (size_t h = 0; h < cfg->NumUeChannels(); h++) {
+          const auto write_status =
+              std::fwrite(ul_ofdm_data.at(i).at(f).at(u).at(h).data(),
+                          sizeof(uint8_t), cfg->OfdmDataNum(), fp_tx_b);
+          if (write_status != cfg->OfdmDataNum()) {
+            throw std::runtime_error(
+                "DataGenerator: Failed to write ul sc bits file");
+          }
+        }
+      }
+    }
+    const auto close_status = std::fclose(fp_tx_b);
+    if (close_status != 0) {
+      throw std::runtime_error(
+          "DataGenerator: Failed to close ul sc bits file");
     }
   }
 }

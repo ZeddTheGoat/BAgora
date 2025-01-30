@@ -9,8 +9,10 @@
 
 #include "logger.h"
 
-PhyStats::PhyStats(Config* const cfg, Direction dir)
+PhyStats::PhyStats(Config* const cfg, MacScheduler* const mac_sched,
+                   Direction dir)
     : config_(cfg),
+      mac_sched_(mac_sched),
       dir_(dir),
       logger_plt_snr_(CsvLog::kPltSnr, cfg, dir, true),
       logger_plt_rssi_(CsvLog::kPltRssi, cfg, dir, true),
@@ -85,8 +87,6 @@ PhyStats::PhyStats(Config* const cfg, Direction dir)
                           Agora_memory::Alignment_t::kAlign64);
   csi_cond_.Calloc(kFrameWnd, cfg->OfdmDataNum(),
                    Agora_memory::Alignment_t::kAlign64);
-  gt_cube_ = arma::cx_fcube(this->config_->UeAntNum(),
-                            this->config_->OfdmDataNum(), num_rxdata_symbols_);
 }
 
 PhyStats::~PhyStats() {
@@ -120,7 +120,14 @@ PhyStats::~PhyStats() {
 
 void PhyStats::LoadGroundTruthIq() {
   if (num_rxdata_symbols_ > 0) {
-    for (size_t i = 0; i < num_rxdata_symbols_; i++) {
+    size_t n_frames = 1;
+    if (config_->AdaptUes()) {
+      n_frames = mac_sched_->NumGroups();
+    }
+    gt_cube_ =
+        arma::cx_fcube(this->config_->UeAntNum(), this->config_->OfdmDataNum(),
+                       n_frames * num_rxdata_symbols_);
+    for (size_t i = 0; i < num_rxdata_symbols_ * n_frames; i++) {
       auto* iq_f_ptr = reinterpret_cast<arma::cx_float*>(
           (dir_ == Direction::kDownlink) ? config_->DlIqF()[i]
                                          : config_->UlIqF()[i]);
@@ -567,7 +574,12 @@ void PhyStats::UpdateCsiCond(size_t frame_id, size_t sc_id, float cond) {
 void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
                          const arma::cx_fvec& eq_vec,
                          const arma::uvec& ue_list) {
-  arma::cx_fvec tx_data = gt_cube_.slice(data_symbol_id).col(sc_id);
+  size_t sched_id = data_symbol_id;
+  if (config_->AdaptUes()) {
+    mac_sched_->UpdateScheduler(frame_id);
+    sched_id += mac_sched_->SelectedGroup() * num_rxdata_symbols_;
+  }
+  arma::cx_fvec tx_data = gt_cube_.slice(sched_id).col(sc_id);
   arma::fvec evm_vec = arma::square(arma::abs(eq_vec - tx_data(ue_list)));
   if (kEnableCsvLog) {
     for (const auto& ue_id : ue_list) {
@@ -583,8 +595,13 @@ void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
 
 void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
                          size_t tx_ue_id, size_t rx_ue_id, arma::cx_float eq) {
-  const float evm =
-      std::norm(eq - gt_cube_.slice(data_symbol_id)(tx_ue_id, sc_id));
+  size_t sched_id = data_symbol_id;
+  if (config_->AdaptUes()) {
+    mac_sched_->UpdateScheduler(frame_id);
+    sched_id += mac_sched_->SelectedGroup() * num_rxdata_symbols_;
+  }
+  arma::cx_float tx_data = gt_cube_.slice(sched_id).at(tx_ue_id, sc_id);
+  const float evm = std::norm(eq - tx_data);
   evm_buffer_[frame_id % kFrameWnd][rx_ue_id] += evm;
   evm_sc_buffer_[frame_id % kFrameWnd]
                 [rx_ue_id * config_->OfdmDataNum() + sc_id] = evm;

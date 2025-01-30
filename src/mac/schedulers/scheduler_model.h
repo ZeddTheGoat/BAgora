@@ -39,6 +39,9 @@ class SchedulerModel {
     return {};
   }
 
+  virtual size_t SelectedUlMcs(size_t  /*frame_id*/, size_t  /*ue_id*/) { return 0; }
+  virtual size_t SelectedDlMcs(size_t  /*frame_id*/, size_t  /*ue_id*/) { return 0; }
+
   static std::unique_ptr<SchedulerModel> CreateSchedulerModel(
       Config* const cfg);
 
@@ -50,6 +53,9 @@ class SchedulerModel {
 
   Table<size_t> schedule_buffer_index_;
   Table<int> schedule_buffer_;
+
+  Table<size_t> ul_mcs_buffer_;
+  Table<size_t> dl_mcs_buffer_;
 
   size_t selected_group_{0};
   size_t num_groups_;

@@ -313,10 +313,11 @@ void Stats::SaveToFile() {
         kStatsSymbolDataFilename + "_bsant" +
         std::to_string(config_->BsAntNum()) + "_ueant" +
         std::to_string(config_->UeAntNum()) + "_mcsul" +
-        std::to_string(config_->McsIndex(Direction::kUplink)) + "_snrdb" +
-        std::to_string(snr_db) + "_ldpciter" +
-        std::to_string(
-            config_->LdpcConfig(Direction::kUplink).MaxDecoderIter()) +
+        std::to_string(config_->MacParams().McsIndex(Direction::kUplink)) +
+        "_snrdb" + std::to_string(snr_db) + "_ldpciter" +
+        std::to_string(config_->MacParams()
+                           .LdpcConfig(Direction::kUplink)
+                           .MaxDecoderIter()) +
         "_workers" + std::to_string(config_->WorkerThreadNum()) + ".txt";
 
     AGORA_LOG_INFO("Stats: Saving symbol level master timestamps to %s\n",
@@ -709,7 +710,9 @@ void Stats::PrintSummary() {
       double encode_frames =
           (static_cast<double>(
               num_tasks.at(static_cast<size_t>(DoerType::kEncode)))) /
-          (this->config_->LdpcConfig(Direction::kDownlink).NumBlocksInSymbol() *
+          (this->config_->MacParams()
+               .LdpcConfig(Direction::kDownlink)
+               .NumBlocksInSymbol() *
            this->config_->UeAntNum() * this->config_->Frame().NumDLSyms());
       std::printf("Downlink totals (tasks, frames): ");
       std::printf("CSI (%zu, %.2f), ",
@@ -742,7 +745,9 @@ void Stats::PrintSummary() {
       double decode_frames =
           (static_cast<double>(
               num_tasks.at(static_cast<size_t>(DoerType::kDecode)))) /
-          (this->config_->LdpcConfig(Direction::kUplink).NumBlocksInSymbol() *
+          (this->config_->MacParams()
+               .LdpcConfig(Direction::kUplink)
+               .NumBlocksInSymbol() *
            this->config_->UeAntNum() * this->config_->Frame().NumULSyms());
       std::printf("Uplink totals (tasks, frames): ");
       std::printf("CSI (%zu, %.2f), ",

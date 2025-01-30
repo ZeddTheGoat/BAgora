@@ -24,7 +24,6 @@ DEFINE_string(
     "Config filename");
 DEFINE_string(chan_model, "RAYLEIGH", "Simulator Channel Type: RAYLEIGH/AWGN");
 DEFINE_string(chan_dataset, "", "Dataset source");
-DEFINE_double(chan_snr, 20.0, "Signal-to-Noise Ratio");
 
 int main(int argc, char* argv[]) {
   int ret = EXIT_FAILURE;
@@ -42,7 +41,7 @@ int main(int argc, char* argv[]) {
       auto sim = std::make_unique<ChannelSim>(
           config.get(), FLAGS_bs_threads, FLAGS_ue_threads,
           FLAGS_worker_threads, FLAGS_core_offset, FLAGS_chan_model,
-          FLAGS_chan_snr, FLAGS_chan_dataset);
+          FLAGS_chan_dataset);
       sim->Run();
       ret = EXIT_SUCCESS;
     } catch (SignalException& e) {

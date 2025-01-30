@@ -27,7 +27,6 @@ class MacMultiRingBuffer {
     }
     size_t& head = head_.at(buf_id);
     std::memcpy(item, &r_buff_.at(buf_id).at(head), n_items);
-    //r_buff_.at(buf_id).at(head) = empty_;
     head = (head + n_items) % kMacBuffSizeMax;
     return true;
   }
@@ -39,16 +38,10 @@ class MacMultiRingBuffer {
   }
 
   bool IsEmpty(size_t n_items, size_t buf_id) {
-    /*size_t tail = tail_.at(buf_id);
-    size_t head = head_.at(buf_id);
-    return (head == tail);*/
     return (this->BuffSize(buf_id) < n_items);
   }
 
   bool IsFull(size_t n_items, size_t buf_id) {
-    /*size_t tail = tail_.at(buf_id);
-    size_t head = head_.at(buf_id);
-    return ((tail + 1) % kMacBuffSizeMax == head);*/
     return ((this->BuffSize(buf_id) + n_items) > kMacBuffSizeMax);
   }
 
@@ -56,5 +49,4 @@ class MacMultiRingBuffer {
   std::array<std::array<std::byte, kMacBuffSizeMax>, kMaxUEs> r_buff_;
   std::array<size_t, kMaxUEs> head_;
   std::array<size_t, kMaxUEs> tail_;
-  //char* empty_;
 };

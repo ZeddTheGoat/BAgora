@@ -54,7 +54,6 @@ Agora::Agora(Config* const cfg)
       config_(cfg),
       mac_sched_(std::make_unique<MacScheduler>(cfg)),
       stats_(std::make_unique<Stats>(cfg)),
-      phy_stats_(std::make_unique<PhyStats>(cfg, Direction::kUplink)),
       agora_memory_(std::make_unique<AgoraBuffer>(cfg)) {
   AGORA_LOG_INFO("Agora: project directory [%s], RDTSC frequency = %.2f GHz\n",
                  kProjectDirectory.c_str(), cfg->FreqGhz());
@@ -69,6 +68,9 @@ Agora::Agora(Config* const cfg)
   frame_tracking_.cur_sche_frame_id_ = 0;
   frame_tracking_.cur_proc_frame_id_ = 0;
 
+  phy_stats_ =
+      std::make_unique<PhyStats>(cfg, mac_sched_.get(), Direction::kUplink);
+  phy_stats_->LoadGroundTruthIq();
   InitializeQueues();
   InitializeCounters();
   InitializeThreads();
@@ -252,7 +254,7 @@ void Agora::ScheduleCodeblocks(EventType event_type, Direction dir,
   auto base_tag = gen_tag_t::FrmSymCb(frame_id, symbol_idx, 0);
   auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0);
   const size_t num_tasks =
-      ue_list.n_elem * config_->LdpcConfig(dir).NumBlocksInSymbol();
+      ue_list.n_elem * mac_sched_->Params().LdpcConfig(dir).NumBlocksInSymbol();
   size_t num_blocks = num_tasks / config_->EncodeBlockSize();
   const size_t num_remainder = num_tasks % config_->EncodeBlockSize();
   if (num_remainder > 0) {
@@ -567,15 +569,18 @@ void Agora::Start() {
         case EventType::kDecode: {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
-          const size_t cb_id = gen_tag_t(event.tags_[0]).cb_id_;
 
           if (config_->DynamicCoreAlloc()) {
+            const size_t cb_id = gen_tag_t(event.tags_[0]).cb_id_;
             this->stats_->MasterSetTscSymbol(TsType::kDecodeDone, frame_id,
                                              symbol_id, cb_id);
           }
-
-          const bool last_decode_task =
-              this->decode_counters_.CompleteTask(frame_id, symbol_id);
+          const auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+          const size_t n_code_blk_per_sym = mac_sched_->Params()
+                                                .LdpcConfig(Direction::kUplink)
+                                                .NumBlocksInSymbol();
+          const bool last_decode_task = this->decode_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem * n_code_blk_per_sym);
 
           if (last_decode_task == true) {
             ScheduleUsers(EventType::kPacketToMac, frame_id, symbol_id);
@@ -700,7 +705,10 @@ void Agora::Start() {
           // This is an entire frame (multiple mac packets)
           const size_t frame_id = rx_mac_tag_t(event.tags_[0u]).frame_id_;
           // Assert ue_id is in ue_list
+          const size_t ue_id = rx_mac_tag_t(event.tags_[0u]).tid_;
           auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+          RtAssert(arma::find(ue_list == ue_id).is_empty() == false,
+                   "Indicated UE index is not scheduled in this frame!");
           const bool last_ue = this->mac_to_phy_counters_.CompleteTask(
               frame_id, 0, ue_list.n_elem);
           if (last_ue == true) {
@@ -1059,9 +1067,9 @@ void Agora::HandleEventFft(size_t tag) {
 }
 
 void Agora::UpdateRanConfig(RanConfig rc) {
-  nlohmann::json msc_params = config_->MCSParams(Direction::kUplink);
-  msc_params["mcs_index"] = rc.mcs_index_;
-  config_->UpdateUlMCS(msc_params);
+  auto ul_mcs_params = mac_sched_->Params().GetMcsJson(Direction::kUplink);
+  ul_mcs_params["mcs_index"] = rc.mcs_index_;
+  mac_sched_->Params().UpdateUlMcsParams(ul_mcs_params);
 }
 
 void Agora::UpdateRxCounters(size_t frame_id, size_t symbol_id, size_t ant_id) {
@@ -1092,6 +1100,7 @@ void Agora::UpdateRxCounters(size_t frame_id, size_t symbol_id, size_t ant_id) {
   }
   // Receive first packet in a frame
   if (rx_counters_.num_pkts_.at(frame_slot) == 0) {
+    mac_sched_->UpdateMcsParams(frame_id);
     // schedule this frame's encoding
     // Defer the schedule.  If frames are already deferred or the current
     // received frame is too far off
@@ -1198,7 +1207,7 @@ void Agora::InitializeCounters() {
   // \todo setting the first dim to NumUlDataSyms breaks the scheduler
   decode_counters_.Init(
       cfg->Frame().NumULSyms(),
-      cfg->LdpcConfig(Direction::kUplink).NumBlocksInSymbol() *
+      cfg->MacParams().LdpcConfig(Direction::kUplink).NumBlocksInSymbol() *
           cfg->SpatialStreamsNum());
 
   tomac_counters_.Init(cfg->Frame().NumULSyms(), cfg->SpatialStreamsNum());
@@ -1206,10 +1215,11 @@ void Agora::InitializeCounters() {
   if (config_->Frame().NumDLSyms() > 0) {
     AGORA_LOG_TRACE("Agora: Initializing downlink buffers\n");
 
-    encode_counters_.Init(
-        config_->Frame().NumDlDataSyms(),
-        config_->LdpcConfig(Direction::kDownlink).NumBlocksInSymbol() *
-            config_->SpatialStreamsNum());
+    encode_counters_.Init(config_->Frame().NumDlDataSyms(),
+                          config_->MacParams()
+                                  .LdpcConfig(Direction::kDownlink)
+                                  .NumBlocksInSymbol() *
+                              config_->SpatialStreamsNum());
     encode_cur_frame_for_symbol_ =
         std::vector<size_t>(config_->Frame().NumDLSyms(), SIZE_MAX);
     ifft_cur_frame_for_symbol_ =
@@ -1304,7 +1314,8 @@ void Agora::InitializeThreads() {
 
 void Agora::SaveDecodeDataToFile(int frame_id) {
   const auto& cfg = config_;
-  const size_t num_decoded_bytes = cfg->MacPacketLength(Direction::kUplink);
+  const size_t num_decoded_bytes =
+      mac_sched_->Params().MacPacketLength(Direction::kUplink);
   auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0 /*sc_id*/);
   AGORA_LOG_INFO("Saving decode data to %s\n", kDecodeDataFilename.c_str());
   auto* fp = std::fopen(kDecodeDataFilename.c_str(), "wb");

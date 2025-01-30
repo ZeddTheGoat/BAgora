@@ -32,7 +32,8 @@ DoDecode::DoDecode(
 DoDecode::~DoDecode() { std::free(resp_var_nodes_); }
 
 EventData DoDecode::Launch(size_t tag) {
-  const LDPCconfig& ldpc_config = cfg_->LdpcConfig(Direction::kUplink);
+  const LDPCconfig& ldpc_config =
+      mac_sched_->Params().LdpcConfig(Direction::kUplink);
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t cb_id = gen_tag_t(tag).cb_id_;
@@ -40,7 +41,8 @@ EventData DoDecode::Launch(size_t tag) {
   const size_t stream_id = (cb_id / ldpc_config.NumBlocksInSymbol());
   const size_t ue_id = mac_sched_->ScheduledUeIndex(frame_id, 0, stream_id);
   const size_t frame_slot = (frame_id % kFrameWnd);
-  const size_t num_bytes_per_cb = cfg_->NumBytesPerCb(Direction::kUplink);
+  const size_t num_bytes_per_cb =
+      mac_sched_->Params().NumBytesPerCb(Direction::kUplink);
   /*RtAssert(symbol_id >=
                cfg_->Frame().GetULSymbol(cfg_->Frame().ClientUlPilotSymbols()),
            "Not a UL data symbol!");*/
@@ -80,7 +82,7 @@ EventData DoDecode::Launch(size_t tag) {
 
     int8_t* llr_buffer_ptr =
         demod_buffers_[frame_slot][data_symbol_idx_ul][stream_id] +
-        (cfg_->ModOrderBits(Direction::kUplink) *
+        (mac_sched_->Params().ModOrderBits(Direction::kUplink) *
          (ldpc_config.NumCbCodewLen() * cur_cb_id));
 
     uint8_t* decoded_buffer_ptr =

@@ -8,13 +8,15 @@
 #include "armadillo"
 #include "common_typedef_sdk.h"
 #include "config.h"
+#include "mac_scheduler.h"
 #include "mat_logger.h"
 #include "memory_manage.h"
 #include "symbols.h"
 
 class PhyStats {
  public:
-  explicit PhyStats(Config* const cfg, Direction dir);
+  explicit PhyStats(Config* const cfg, MacScheduler* const mac_sched,
+                    Direction dir);
   ~PhyStats();
   void LoadGroundTruthIq();
   void PrintPhyStats();
@@ -69,6 +71,7 @@ class PhyStats {
 
  private:
   Config* const config_;
+  MacScheduler* const mac_sched_;
   Direction dir_;
   Table<size_t> decoded_bits_count_;
   Table<size_t> bit_error_count_;

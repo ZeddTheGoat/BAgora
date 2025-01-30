@@ -80,11 +80,12 @@ int main(int argc, char* argv[]) {
   // Step 1: Generate the information buffers and LDPC-encoded buffers for
   // uplink
   size_t num_symbols_per_cb = 1;
-  size_t bits_per_symbol = cfg->OfdmDataNum() * cfg->ModOrderBits(dir);
-  if (cfg->LdpcConfig(dir).NumCbCodewLen() > bits_per_symbol) {
-    num_symbols_per_cb =
-        (cfg->LdpcConfig(dir).NumCbCodewLen() + bits_per_symbol - 1) /
-        bits_per_symbol;
+  size_t bits_per_symbol =
+      cfg->OfdmDataNum() * cfg->MacParams().ModOrderBits(dir);
+  if (cfg->MacParams().LdpcConfig(dir).NumCbCodewLen() > bits_per_symbol) {
+    num_symbols_per_cb = (cfg->MacParams().LdpcConfig(dir).NumCbCodewLen() +
+                          bits_per_symbol - 1) /
+                         bits_per_symbol;
   }
   size_t num_cbs_per_ue = cfg->Frame().NumDataSyms() / num_symbols_per_cb;
   std::printf("Number of symbols per block: %zu, blocks per frame: %zu\n",
@@ -93,29 +94,30 @@ int main(int argc, char* argv[]) {
   const size_t num_codeblocks = num_cbs_per_ue * cfg->UeAntNum();
   std::printf("Total number of blocks: %zu\n", num_codeblocks);
 
-  size_t num_subcarriers =
-      cfg->LdpcConfig(dir).NumCbCodewLen() / cfg->ModOrderBits(dir);
+  size_t num_subcarriers = cfg->MacParams().LdpcConfig(dir).NumCbCodewLen() /
+                           cfg->MacParams().ModOrderBits(dir);
   std::printf("Total number of filled subcarriers: %zu\n", num_subcarriers);
 
-  size_t input_size = Roundup<64>(
-      LdpcEncodingInputBufSize(cfg->LdpcConfig(dir).BaseGraph(),
-                               cfg->LdpcConfig(dir).ExpansionFactor()));
+  size_t input_size = Roundup<64>(LdpcEncodingInputBufSize(
+      cfg->MacParams().LdpcConfig(dir).BaseGraph(),
+      cfg->MacParams().LdpcConfig(dir).ExpansionFactor()));
   auto* input_ptr = new int8_t[input_size];
   for (size_t noise_id = 0; noise_id < 15; noise_id++) {
     std::vector<std::vector<int8_t>> information(num_codeblocks);
     std::vector<std::vector<int8_t>> encoded_codewords(num_codeblocks);
     for (size_t i = 0; i < num_codeblocks; i++) {
-      data_generator.GenRawData(cfg->LdpcConfig(dir), information.at(i),
+      data_generator.GenRawData(cfg->MacParams().LdpcConfig(dir),
+                                information.at(i),
                                 i % cfg->UeAntNum() /* UE ID */);
       encoded_codewords.at(i) = DataGenerator::GenCodeblock(
-          cfg->LdpcConfig(dir), &information.at(i).at(0),
+          cfg->MacParams().LdpcConfig(dir), &information.at(i).at(0),
           information.at(i).size());
     }
 
     // Save uplink information bytes to file
-    const size_t input_bytes_per_cb =
-        BitsToBytes(LdpcNumInputBits(cfg->LdpcConfig(dir).BaseGraph(),
-                                     cfg->LdpcConfig(dir).ExpansionFactor()));
+    const size_t input_bytes_per_cb = BitsToBytes(
+        LdpcNumInputBits(cfg->MacParams().LdpcConfig(dir).BaseGraph(),
+                         cfg->MacParams().LdpcConfig(dir).ExpansionFactor()));
     if (kPrintUplinkInformationBytes) {
       std::printf("Uplink information bytes\n");
       for (size_t n = 0; n < num_codeblocks; n++) {
@@ -133,24 +135,25 @@ int main(int argc, char* argv[]) {
                                Agora_memory::Alignment_t::kAlign64);
     Table<int8_t> demod_data_all_symbols;
     demod_data_all_symbols.Calloc(
-        num_codeblocks, Roundup<64>(num_subcarriers * cfg->ModOrderBits(dir)),
+        num_codeblocks,
+        Roundup<64>(num_subcarriers * cfg->MacParams().ModOrderBits(dir)),
         Agora_memory::Alignment_t::kAlign64);
 
     // Modulate, add noise, and demodulate the encoded codewords
     for (size_t i = 0; i < num_codeblocks; i++) {
       auto ofdm_symbol = DataGenerator::GetModulation(
-          &encoded_codewords[i][0], cfg->ModTable(dir),
-          cfg->LdpcConfig(dir).NumCbCodewLen(), cfg->OfdmDataNum(),
-          cfg->ModOrderBits(dir));
+          &encoded_codewords[i][0], cfg->MacParams().ModTable(dir),
+          cfg->MacParams().LdpcConfig(dir).NumCbCodewLen(), cfg->OfdmDataNum(),
+          cfg->MacParams().ModOrderBits(dir));
 
       data_generator.GetNoisySymbol(&ofdm_symbol[0], modulated_codewords[i],
                                     num_subcarriers, kNoiseLevels[noise_id]);
 
       Demodulate((float*)modulated_codewords[i], demod_data_all_symbols[i],
-                 num_subcarriers, cfg->ModOrderBits(dir), false);
+                 num_subcarriers, cfg->MacParams().ModOrderBits(dir), false);
     }
 
-    const LDPCconfig& ldpc_config = cfg->LdpcConfig(dir);
+    const LDPCconfig& ldpc_config = cfg->MacParams().LdpcConfig(dir);
     Table<uint8_t> decoded_codewords;
     decoded_codewords.Calloc(num_codeblocks, num_subcarriers,
                              Agora_memory::Alignment_t::kAlign64);

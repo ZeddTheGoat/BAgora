@@ -144,7 +144,8 @@ TEST(TestZF, VaryingConfig) {
                                 Agora_memory::Alignment_t::kAlign64);
 
   auto mac_sched = std::make_unique<MacScheduler>(cfg.get());
-  auto phy_stats = std::make_unique<PhyStats>(cfg.get(), Direction::kUplink);
+  auto phy_stats = std::make_unique<PhyStats>(cfg.get(), mac_sched.get(),
+                                              Direction::kUplink);
   auto stats = std::make_unique<Stats>(cfg.get());
 
   std::vector<std::thread> threads;

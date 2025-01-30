@@ -86,7 +86,7 @@ class Sender {
    * [filepath] must contain path to the data file for one frame. For every
    * symbol and antenna, the file must provide (CP_LEN + OFDM_CA_NUM) IQ samples.
    */
-  void InitIqFromFilePath(const std::string& filepath);
+  void InitIqFromFilePath();
 
   // Get number of CPU ticks for a symbol given a frame index
   uint64_t GetTicksForFrame(size_t frame_id) const;

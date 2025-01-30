@@ -43,18 +43,18 @@ static const std::vector<Agora_recorder::RecorderWorker::RecorderWorkerTypes>
 PhyUe::PhyUe(Config* config)
     : mac_sched_(std::make_unique<MacScheduler>(config)),
       stats_(std::make_unique<Stats>(config)),
-      phy_stats_(std::make_unique<PhyStats>(config, Direction::kDownlink)),
       demod_buffer_(kFrameWnd, config->Frame().NumDlDataSyms(),
                     config->UeAntNum(),
                     kMaxModType * Roundup<64>(config->GetOFDMDataNum())),
       decoded_buffer_(
           kFrameWnd, config->Frame().NumDlDataSyms(), config->UeAntNum(),
-          config->LdpcConfig(Direction::kDownlink).NumBlocksInSymbol() *
-              Roundup<64>(config->NumBytesPerCb(Direction::kDownlink))) {
+          config->MacParams().MaxPacketBytes(Direction::kDownlink)) {
   srand(time(nullptr));
   // TODO take into account the UeAntOffset to allow for multiple PhyUe
   // instances
   this->config_ = config;
+  phy_stats_ = std::make_unique<PhyStats>(config, mac_sched_.get(),
+                                          Direction::kDownlink);
   InitializeVarsFromCfg();
 
   for (size_t i = config_->OfdmDataStart();
@@ -385,6 +385,10 @@ void PhyUe::Start() {
                                                  frame_id, frame_id - 1),
                   rx_counters_.num_pkts_.at(prev_frame_slot));
             }
+            if (config_->AdaptUes()) {
+              // Update MCS parameters for this frame (should be done once per frame)
+              mac_sched_->UpdateMcsParams(frame_id);
+            }
           }
 
           if (config_->Frame().IsDlPilot(symbol_id)) {
@@ -429,6 +433,7 @@ void PhyUe::Start() {
                 ScheduleWork(ifft_task);
               }  // For all UL Symbols
               if (mac_sched_->IsUeScheduled(frame_id, 0u, ant_id)) {
+                // request packet from MAC
                 EventData req_mac_task(EventType::kPacketFromMac,
                                        gen_tag_t::FrmUe(frame_id, ant_id).tag_);
                 ScheduleTask(req_mac_task, &to_mac_queue_, ptok_mac);
@@ -661,8 +666,9 @@ void PhyUe::Start() {
           EventData do_modul_task(EventType::kModul, event.tags_[0]);
           ScheduleWork(do_modul_task);
 
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
           const bool symbol_complete =
-              encode_counter_.CompleteTask(frame_id, symbol_id);
+              encode_counter_.CompleteTask(frame_id, symbol_id, ue_list.n_elem);
           if (symbol_complete == true) {
             PrintPerSymbolDone(PrintType::kEncode, frame_id, symbol_id);
 
@@ -688,8 +694,9 @@ void PhyUe::Start() {
               gen_tag_t::FrmSymUe(frame_id, symbol_id, ue_ant).tag_);
           ScheduleWork(do_ifft_task);
 
-          const bool symbol_complete =
-              modulation_counters_.CompleteTask(frame_id, symbol_id);
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+          const bool symbol_complete = modulation_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem);
           if (symbol_complete) {
             PrintPerSymbolDone(PrintType::kModul, frame_id, symbol_id);
 
@@ -859,14 +866,15 @@ void PhyUe::InitializeVarsFromCfg() {
 
 void PhyUe::InitializeUplinkBuffers() {
   // initialize ul data buffer
+  const size_t ul_data_syms_buffer_dim1 = ul_data_symbol_perframe_ * kFrameWnd;
   ul_bits_buffer_size_ =
-      kFrameWnd * config_->MacBytesNumPerframe(Direction::kUplink);
+      ul_data_syms_buffer_dim1 *
+      config_->MacParams().MaxPacketBytes(Direction::kUplink);
   ul_bits_buffer_.Malloc(config_->UeAntNum(), ul_bits_buffer_size_,
                          Agora_memory::Alignment_t::kAlign64);
   ul_bits_buffer_status_.Calloc(config_->UeAntNum(), kFrameWnd,
                                 Agora_memory::Alignment_t::kAlign64);
 
-  const size_t ul_data_syms_buffer_dim1 = ul_data_symbol_perframe_ * kFrameWnd;
   const size_t encoded_buffer_dim2 =
       Roundup<64>(config_->OfdmDataNum()) * config_->UeAntNum();
 

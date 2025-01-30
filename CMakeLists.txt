@@ -430,6 +430,7 @@ set(COMMON_SOURCES
   src/common/phy_stats.cc
   src/common/framestats.cc
   src/agora/doencode.cc
+  src/common/mac_utils.cc
   src/common/utils.cc
   src/common/config.cc
   src/common/fivegconfig.cc

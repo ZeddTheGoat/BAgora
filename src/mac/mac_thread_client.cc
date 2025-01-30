@@ -53,7 +53,7 @@ MacThreadClient::MacThreadClient(
 
   // The frame data will hold the data comming from the Phy (Received)
   for (auto& v : server_.frame_data_) {
-    v.resize(cfg_->MacDataBytesNumPerframe(Direction::kDownlink));
+    v.resize(cfg_->MacParams().MacDataBytesNumPerframe(Direction::kDownlink));
   }
 
   const size_t udp_control_len = sizeof(RBIndicator);
@@ -68,8 +68,11 @@ MacThreadClient::MacThreadClient(
       std::make_unique<UDPServer>(cfg_->UeServerAddr(), kMacBaseClientPort,
                                   udp_control_len * kMaxUEs * kMaxPktsPerUE);
 
-  const size_t udp_pkt_len = cfg_->MacBytesNumPerframe(Direction::kUplink);
-  udp_pkt_buf_.resize(udp_pkt_len + kUdpRxBufferPadding);
+  const size_t udp_pkt_len =
+      cfg_->MacParams().MacBytesNumPerframe(Direction::kUplink);
+  if (udp_pkt_len != 0) {
+    udp_pkt_buf_.resize(udp_pkt_len + kUdpRxBufferPadding);
+  }
 
   crc_obj_ = std::make_unique<DoCRC>();
 
@@ -86,10 +89,20 @@ MacThreadClient::MacThreadClient(
     next_radio_id_ = 0;
     next_tx_frame_id_ = 0;
   } else {
-    num_dl_mac_bytes_ = cfg->MacBytesNumPerframe(Direction::kDownlink);
+    size_t sched_size = 1;
+    if (cfg->AdaptUes() == true) {
+      sched_size = mac_sched_->NumGroups();
+    }
+    num_dl_mac_bytes_ =
+        cfg->MacParams().MacBytesNumPerframe(Direction::kDownlink);
     if (num_dl_mac_bytes_ > 0) {
+      const size_t dl_pkt_per_frame =
+          cfg->MacParams().MacPacketsPerframe(Direction::kDownlink);
+      const size_t num_dl_max_bytes =
+          cfg->MacParams().MaxPacketBytes(Direction::kDownlink) *
+          dl_pkt_per_frame;
       // Downlink LDPC input bits
-      dl_mac_bytes_.Calloc(cfg_->UeAntNum(), num_dl_mac_bytes_,
+      dl_mac_bytes_.Calloc(sched_size * cfg_->UeAntNum(), num_dl_max_bytes,
                            Agora_memory::Alignment_t::kAlign64);
       const std::string dl_data_file =
           kExperimentFilepath + kDlLdpcDataPrefix +
@@ -99,18 +112,24 @@ MacThreadClient::MacThreadClient(
                       dl_data_file.c_str());
 
       size_t seek_offset =
-          num_dl_mac_bytes_ * cfg_->UeAntOffset() * sizeof(int8_t);
-      for (size_t j = 0; j < cfg_->UeAntNum(); j++) {
-        Utils::ReadBinaryFile(dl_data_file, sizeof(int8_t), num_dl_mac_bytes_,
+          num_dl_max_bytes * cfg_->UeAntOffset() * sizeof(int8_t);
+      for (size_t j = 0; j < cfg_->UeAntNum() * sched_size; j++) {
+        Utils::ReadBinaryFile(dl_data_file, sizeof(int8_t), num_dl_max_bytes,
                               seek_offset, dl_mac_bytes_[j]);
-        seek_offset += num_dl_mac_bytes_ * sizeof(int8_t);
+        seek_offset += num_dl_max_bytes * sizeof(int8_t);
       }
     }
 
-    num_ul_mac_bytes_ = cfg->MacBytesNumPerframe(Direction::kUplink);
+    num_ul_mac_bytes_ =
+        cfg->MacParams().MacBytesNumPerframe(Direction::kUplink);
     if (num_ul_mac_bytes_ > 0) {
-      // Downlink LDPC input bits
-      ul_mac_bytes_.Calloc(cfg_->UeAntNum(), num_ul_mac_bytes_,
+      const size_t ul_pkt_per_frame =
+          cfg->MacParams().MacPacketsPerframe(Direction::kUplink);
+      const size_t num_ul_max_bytes =
+          cfg->MacParams().MaxPacketBytes(Direction::kUplink) *
+          ul_pkt_per_frame;
+      // Uplink LDPC input bits
+      ul_mac_bytes_.Calloc(sched_size * cfg_->UeAntNum(), num_ul_max_bytes,
                            Agora_memory::Alignment_t::kAlign64);
       const std::string ul_data_file =
           kExperimentFilepath + kUlLdpcDataPrefix +
@@ -120,11 +139,11 @@ MacThreadClient::MacThreadClient(
                       ul_data_file.c_str());
 
       size_t seek_offset =
-          num_ul_mac_bytes_ * cfg_->UeAntOffset() * sizeof(int8_t);
-      for (size_t j = 0; j < cfg_->UeAntNum(); j++) {
-        Utils::ReadBinaryFile(ul_data_file, sizeof(int8_t), num_ul_mac_bytes_,
+          num_ul_max_bytes * cfg_->UeAntOffset() * sizeof(int8_t);
+      for (size_t j = 0; j < cfg_->UeAntNum() * sched_size; j++) {
+        Utils::ReadBinaryFile(ul_data_file, sizeof(int8_t), num_ul_max_bytes,
                               seek_offset, ul_mac_bytes_[j]);
-        seek_offset += num_ul_mac_bytes_ * sizeof(int8_t);
+        seek_offset += num_ul_max_bytes * sizeof(int8_t);
       }
     }
   }
@@ -184,7 +203,7 @@ void MacThreadClient::ProcessCodeblocksFromPhy(EventData event) {
   if (symbol_array_index >= num_pilot_symbols) {
     const size_t data_symbol_idx_dl = symbol_array_index - num_pilot_symbols;
     const size_t dest_packet_size =
-        cfg_->MacPayloadMaxLength(Direction::kDownlink);
+        mac_sched_->Params().MacPayloadMaxLength(Direction::kDownlink);
     const size_t frame_slot = (frame_id % kFrameWnd);
 
     const int8_t* src_data =
@@ -194,15 +213,20 @@ void MacThreadClient::ProcessCodeblocksFromPhy(EventData event) {
         const size_t symbol_offset =
             cfg_->GetTotalDataSymbolIdxDl(frame_id, data_symbol_idx_dl);
         const size_t mac_packet_len =
-            cfg_->MacPacketLength(Direction::kDownlink);
+            mac_sched_->Params().MacPacketLength(Direction::kDownlink);
         phy_stats_->UpdateDecodedBits(ue_id, symbol_offset, frame_slot,
                                       dest_packet_size * 8);
         phy_stats_->IncrementDecodedBlocks(ue_id, symbol_offset, frame_slot);
+        size_t sched_id = ue_id;
+        if (cfg_->AdaptUes()) {
+          mac_sched_->UpdateScheduler(frame_id);
+          sched_id += mac_sched_->SelectedGroup() * cfg_->UeAntNum();
+        }
         size_t block_error(0);
         for (size_t i = 0; i < mac_packet_len; i++) {
           int8_t rx_byte = src_data[i];
           auto tx_byte =
-              this->dl_mac_bytes_[ue_id]
+              this->dl_mac_bytes_[sched_id]
                                  [data_symbol_idx_dl * mac_packet_len + i];
           phy_stats_->UpdateBitErrors(ue_id, symbol_offset, frame_slot, tx_byte,
                                       rx_byte);
@@ -223,10 +247,10 @@ void MacThreadClient::ProcessCodeblocksFromPhy(EventData event) {
       const size_t data_symbol_index_end = cfg_->Frame().GetDLSymbolLast();
 
       const size_t mac_data_bytes_per_frame =
-          cfg_->MacDataBytesNumPerframe(Direction::kDownlink);
+          mac_sched_->Params().MacDataBytesNumPerframe(Direction::kDownlink);
 
       const size_t num_mac_packets_per_frame =
-          cfg_->MacPacketsPerframe(Direction::kDownlink);
+          mac_sched_->Params().MacPacketsPerframe(Direction::kDownlink);
       // Destination only contains "payload"
 
       // TODO: enable ARQ and ensure reliable data goes to app
@@ -239,18 +263,19 @@ void MacThreadClient::ProcessCodeblocksFromPhy(EventData event) {
          << frame_id << " symbol " << pkt->Symbol() << ":" << symbol_id
          << " user " << pkt->Ue() << ":" << ue_id << " length "
          << pkt->PayloadLength() << ":"
-         << cfg_->MacPayloadMaxLength(Direction::kDownlink) << " crc "
-         << pkt->Crc() << " copied to offset " << frame_data_offset
+         << mac_sched_->Params().MacPayloadMaxLength(Direction::kDownlink)
+         << " crc " << pkt->Crc() << " copied to offset " << frame_data_offset
          << std::endl;
 
       if (kLogRxMacPackets) {
         ss << "Header Info:" << std::endl
-           << "FRAME_ID:  " << pkt->Frame() << std::endl
+           << "FRAME_ID: " << pkt->Frame() << std::endl
            << "SYMBOL_ID: " << pkt->Symbol() << std::endl
-           << "UE_ID:     " << pkt->Ue() << std::endl
-           << "DATALEN:   " << pkt->PayloadLength() << std::endl
+           << "UE_ID: " << pkt->Ue() << std::endl
+           << "DATLEN: " << pkt->PayloadLength() << std::endl
            << "PAYLOAD:" << std::endl;
-        for (size_t i = 0; i < cfg_->MacPayloadMaxLength(Direction::kDownlink);
+        for (size_t i = 0;
+             i < mac_sched_->Params().MacPayloadMaxLength(Direction::kDownlink);
              i++) {
           ss << std::setw(2) << std::setfill('0') << std::hex
              << (int)pkt->Data()[i] << " ";
@@ -317,7 +342,8 @@ void MacThreadClient::ProcessCodeblocksFromPhy(EventData event) {
             }
           }
           dest_offset += rx_packet_size;
-          src_offset += cfg_->MacPayloadMaxLength(Direction::kDownlink);
+          src_offset +=
+              mac_sched_->Params().MacPayloadMaxLength(Direction::kDownlink);
         }
 
         if (dest_offset > 0) {
@@ -366,15 +392,16 @@ void MacThreadClient::ProcessControlInformation() {
 
 void MacThreadClient::ProcessUdpPacketsFromApps() {
   const size_t max_data_bytes_per_frame =
-      cfg_->MacDataBytesNumPerframe(Direction::kUplink);
+      mac_sched_->Params().MacDataBytesNumPerframe(Direction::kUplink);
 
   const size_t num_mac_packets_per_frame =
-      cfg_->MacPacketsPerframe(Direction::kUplink);
+      mac_sched_->Params().MacPacketsPerframe(Direction::kUplink);
 
-  const size_t mac_packet_length = cfg_->MacPacketLength(Direction::kUplink);
+  const size_t mac_packet_length =
+      mac_sched_->Params().MacPacketLength(Direction::kUplink);
 
   const size_t num_mac_bytes_per_frame =
-      cfg_->MacBytesNumPerframe(Direction::kUplink);
+      mac_sched_->Params().MacBytesNumPerframe(Direction::kUplink);
 
   if (0 == max_data_bytes_per_frame) {
     return;
@@ -501,10 +528,13 @@ void MacThreadClient::SendCodeblocksToPhy(EventData event) {
   size_t ue_id = gen_tag_t(event.tags_[0]).ue_id_;
 
   const size_t num_mac_packets_per_frame =
-      cfg_->MacPacketsPerframe(Direction::kUplink);
-  const size_t mac_packet_length = cfg_->MacPacketLength(Direction::kUplink);
+      mac_sched_->Params().MacPacketsPerframe(Direction::kUplink);
+  const size_t max_packet_length =
+      cfg_->MacParams().MaxPacketBytes(Direction::kUplink);
+  const size_t mac_packet_length =
+      mac_sched_->Params().MacPacketLength(Direction::kUplink);
   const size_t mac_payload_length =
-      cfg_->MacPayloadMaxLength(Direction::kUplink);
+      mac_sched_->Params().MacPayloadMaxLength(Direction::kUplink);
   const size_t num_pilot_symbols = cfg_->Frame().ClientUlPilotSymbols();
 
   next_radio_id_ = ue_id;
@@ -520,12 +550,12 @@ void MacThreadClient::SendCodeblocksToPhy(EventData event) {
   }
 
   const size_t dest_pkt_base =
-      (radio_buf_id * num_mac_packets_per_frame) * mac_packet_length;
+      (radio_buf_id * num_mac_packets_per_frame) * max_packet_length;
 
-  if (kEnableMac) {
-    // Copy from the packet rx buffer into ul_bits memory
-    for (size_t pkt_id = 0; pkt_id < num_mac_packets_per_frame; pkt_id++) {
-      const size_t dest_pkt_offset = dest_pkt_base + pkt_id * mac_packet_length;
+  // Copy from the packet rx buffer into ul_bits memory
+  for (size_t pkt_id = 0; pkt_id < num_mac_packets_per_frame; pkt_id++) {
+    const size_t dest_pkt_offset = dest_pkt_base + pkt_id * max_packet_length;
+    if (kEnableMac) {
       std::byte* pkt_bits = reinterpret_cast<std::byte*>(
           &(*client_.ul_bits_buffer_)[ue_id][dest_pkt_offset]);
       AGORA_LOG_INFO(
@@ -561,9 +591,9 @@ void MacThreadClient::SendCodeblocksToPhy(EventData event) {
 
         ss << "MacThreadClient: created packet frame " << next_tx_frame_id_
            << ", pkt " << pkt_id << ", size "
-           << cfg_->MacPayloadMaxLength(Direction::kUplink) << " radio buff id "
-           << radio_buf_id << ", loc " << (size_t)pkt << " dest offset "
-           << dest_pkt_offset << std::endl;
+           << mac_sched_->Params().MacPayloadMaxLength(Direction::kUplink)
+           << " radio buff id " << radio_buf_id << ", loc " << (size_t)pkt
+           << " dest offset " << dest_pkt_offset << std::endl;
 
         ss << "Header Info:" << std::endl
            << "FRAME_ID:  " << pkt->Frame() << std::endl
@@ -580,11 +610,18 @@ void MacThreadClient::SendCodeblocksToPhy(EventData event) {
         //std::fprintf(log_file_, "%s", ss.str().c_str());
         ss.str("");
       }
-    }  // end all packets
-  } else {
-    std::memmove(&(*client_.ul_bits_buffer_)[ue_id][dest_pkt_base],
-                 ul_mac_bytes_[ue_id], num_ul_mac_bytes_);
-  }
+    } else {
+      size_t sched_id = ue_id;
+      if (cfg_->AdaptUes()) {
+        // we are using custom scheduler here
+        mac_sched_->UpdateScheduler(frame_id);
+        sched_id = mac_sched_->SelectedGroup() * cfg_->UeAntNum() + ue_id;
+      }
+      std::memmove(&(*client_.ul_bits_buffer_)[ue_id][dest_pkt_offset],
+                   ul_mac_bytes_[sched_id] + pkt_id * mac_packet_length,
+                   mac_packet_length);
+    }
+  }  // end all packets
   (*client_.ul_bits_buffer_status_)[ue_id][radio_buf_id] = 1;
   EventData msg(EventType::kPacketFromMac,
                 rx_mac_tag_t(frame_id, ue_id, radio_buf_id).tag_);

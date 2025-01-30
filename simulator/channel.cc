@@ -10,23 +10,19 @@
 
 static constexpr bool kPrintChannelOutput = false;
 static constexpr bool kPrintSNRCheck = false;
-static constexpr double kMeanChannelGain = 0.1f;
 
 Channel::~Channel() = default;
 
 Channel::Channel(const Config* const config, std::string& in_channel_type,
-                 double in_channel_snr, std::string& dataset_path)
-    : cfg_(config),
-      sim_chan_model_(std::move(in_channel_type)),
-      channel_snr_db_(in_channel_snr) {
+                 std::string& dataset_path)
+    : cfg_(config), sim_chan_model_(std::move(in_channel_type)) {
   channel_model_ = std::move(
       ChannelModel::CreateChannelModel(cfg_, sim_chan_model_, dataset_path));
 
-  const float snr_lin = std::pow(10, channel_snr_db_ / 10.0f);
-  noise_samp_std_ = std::sqrt(kMeanChannelGain / (snr_lin * 2.0f));
+  noise_samp_std_ = config->NoiseLevel() / std::sqrt(2);
 
   std::cout << "Noise level to be used is: " << std::fixed << std::setw(5)
-            << std::setprecision(2) << noise_samp_std_ << std::endl;
+            << std::setprecision(3) << noise_samp_std_ << std::endl;
 }
 
 void Channel::ApplyChan(const arma::cx_fmat& fmat_src, arma::cx_fmat& fmat_dst,
@@ -34,7 +30,7 @@ void Channel::ApplyChan(const arma::cx_fmat& fmat_src, arma::cx_fmat& fmat_dst,
   arma::cx_fmat fmat_h;
 
   if (is_newChan) {
-    channel_model_->UpdateModel(kMeanChannelGain);
+    channel_model_->UpdateModel();
   }
 
   switch (channel_model_->GetFadingType()) {
@@ -72,7 +68,7 @@ void Channel::ApplyChan(const arma::cx_fmat& fmat_src, arma::cx_fmat& fmat_dst,
 }
 
 void Channel::Awgn(const arma::cx_fmat& src, arma::cx_fmat& dst) const {
-  if (channel_snr_db_ < 120.0f) {
+  if (cfg_->NoiseLevel() < 0.0001f) {
     const int n_row = src.n_rows;
     const int n_col = src.n_cols;
 

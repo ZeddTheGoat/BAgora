@@ -34,7 +34,8 @@ DoDecodeClient::DoDecodeClient(
 DoDecodeClient::~DoDecodeClient() { std::free(resp_var_nodes_); }
 
 EventData DoDecodeClient::Launch(size_t tag) {
-  const LDPCconfig& ldpc_config = cfg_->LdpcConfig(Direction::kDownlink);
+  const LDPCconfig& ldpc_config =
+      mac_sched_->Params().LdpcConfig(Direction::kDownlink);
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t cb_id = gen_tag_t(tag).cb_id_;
@@ -79,12 +80,13 @@ EventData DoDecodeClient::Launch(size_t tag) {
 
   int8_t* llr_buffer_ptr =
       demod_buffers_[frame_slot][data_symbol_idx_dl][ue_id] +
-      (cfg_->ModOrderBits(Direction::kDownlink) *
+      (mac_sched_->Params().ModOrderBits(Direction::kDownlink) *
        (ldpc_config.NumCbCodewLen() * cur_cb_id));
 
   uint8_t* decoded_buffer_ptr =
       (uint8_t*)decoded_buffers_[frame_slot][data_symbol_idx_dl][ue_id] +
-      (cur_cb_id * Roundup<64>(cfg_->NumBytesPerCb(Direction::kDownlink)));
+      (cur_cb_id *
+       Roundup<64>(mac_sched_->Params().NumBytesPerCb(Direction::kDownlink)));
 
   ldpc_decoder_5gnr_request.varNodes = llr_buffer_ptr;
   ldpc_decoder_5gnr_response.compactedMessageBytes = decoded_buffer_ptr;
@@ -96,8 +98,9 @@ EventData DoDecodeClient::Launch(size_t tag) {
                           &ldpc_decoder_5gnr_response);
 
   if (cfg_->ScrambleEnabled()) {
-    scrambler_->Descramble(decoded_buffer_ptr,
-                           cfg_->NumBytesPerCb(Direction::kDownlink));
+    scrambler_->Descramble(
+        decoded_buffer_ptr,
+        mac_sched_->Params().NumBytesPerCb(Direction::kDownlink));
   }
 
   size_t start_tsc2 = GetTime::WorkerRdtsc();

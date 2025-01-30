@@ -73,7 +73,7 @@ void AgoraWorker::WorkLoop() {
       buffer_->GetDlModBits(), mac_sched_, stats_);
 
   auto compute_encoding = std::make_unique<DoEncode>(
-      config_, tid, Direction::kDownlink, buffer_->GetDlBits(), kFrameWnd,
+      config_, tid, Direction::kDownlink, buffer_->GetDlBits(),
       buffer_->GetDlModBits(), mac_sched_, stats_);
 
   // Uplink workers

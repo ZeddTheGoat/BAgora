@@ -14,7 +14,7 @@ class DatasetModel : public ChannelModel {
   DatasetModel(size_t bs_ant_num, size_t ue_ant_num, size_t samples_per_sym,
                const std::string& dataset_path);
 
-  void UpdateModel(const float mean_channel_gain) final;
+  void UpdateModel() final;
 
  private:
   arma::cx_fmat GetMatricesByFrame(size_t frame);

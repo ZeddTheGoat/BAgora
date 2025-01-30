@@ -16,7 +16,7 @@
 class Channel {
  public:
   Channel(const Config* const config, std::string& channel_type,
-          double channel_snr, std::string& dataset_path);
+          std::string& dataset_path);
   ~Channel();
 
   // Dimensions of fmat_src: ( bscfg->sampsPerSymbol, uecfg->UE_ANT_NUM )
@@ -30,7 +30,6 @@ class Channel {
  private:
   const Config* const cfg_;
   std::string sim_chan_model_;
-  double channel_snr_db_;
   double noise_samp_std_;
 
   std::unique_ptr<ChannelModel> channel_model_;

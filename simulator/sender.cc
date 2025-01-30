@@ -80,7 +80,7 @@ Sender::Sender(Config* cfg, size_t socket_thread_num, size_t core_offset,
     InitUesFromFile();
   }
 
-  InitIqFromFilePath(kExperimentFilepath);
+  InitIqFromFilePath();
 
   task_ptok_ =
       static_cast<moodycamel::ProducerToken**>(Agora_memory::PaddedAlignedAlloc(
@@ -568,8 +568,9 @@ void Sender::InitUesFromFile() {
 
   const std::string directory =
       TOSTRING(PROJECT_DIRECTORY) "/files/experiment/";
-  static const std::string kFilename =
-      directory + kUeSchedulePrefix + std::to_string(cfg_->UeAntNum()) + ".bin";
+  static const std::string kFilename = directory + kUeSchedulePrefix +
+                                       std::to_string(cfg_->UeAntNum()) +
+                                       "ue.bin";
   AGORA_LOG_INFO(
       "Custom MAC Scheduler: Reading binary map of scheduled UEs across frames "
       "from %s\n",
@@ -641,7 +642,7 @@ void Sender::InitUesFromFile() {
   }
 }
 
-void Sender::InitIqFromFilePath(const std::string& filepath) {
+void Sender::InitIqFromFilePath() {
   const size_t packets_per_frame =
       cfg_->Frame().NumTotalSyms() * cfg_->BsAntNum();
   iq_data_short_.Calloc(packets_per_frame * max_ue_sched_num_,
@@ -652,7 +653,7 @@ void Sender::InitIqFromFilePath(const std::string& filepath) {
   iq_data_temp.Calloc(packets_per_frame, (cfg_->SampsPerSymbol()) * 2,
                       Agora_memory::Alignment_t::kAlign64);
 
-  const std::string filename = filepath + kUlRxPrefix +
+  const std::string filename = kExperimentFilepath + kUlRxPrefix +
                                std::to_string(cfg_->OfdmCaNum()) + "_bsant" +
                                std::to_string(cfg_->BsAntNum()) + "_ueant" +
                                std::to_string(cfg_->UeAntNum()) + ".bin";

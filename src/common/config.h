@@ -17,10 +17,11 @@
 
 #include "armadillo"
 #include "common_typedef_sdk.h"
+#include "comms-lib.h"
 #include "concurrent_queue_wrapper.h"
 #include "framestats.h"
 #include "gettime.h"
-#include "ldpc_config.h"
+#include "mac_utils.h"
 #include "memory_manage.h"
 #include "nlohmann/json.hpp"
 #include "symbols.h"
@@ -250,70 +251,12 @@ class Config {
   inline float Scale() const { return this->scale_; }
   inline bool BigstationMode() const { return this->bigstation_mode_; }
   inline size_t DlPacketLength() const { return this->dl_packet_length_; }
-  inline std::string Modulation(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_modulation_
-                                     : this->dl_modulation_;
-  }
-  inline size_t ModOrderBits(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mod_order_bits_
-                                     : this->dl_mod_order_bits_;
-  }
-  inline size_t NumBytesPerCb(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_num_bytes_per_cb_
-                                     : this->dl_num_bytes_per_cb_;
-  }
-  inline size_t NumPaddingBytesPerCb(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_num_padding_bytes_per_cb_
-                                     : this->dl_num_padding_bytes_per_cb_;
-  }
-  inline size_t MacDataBytesNumPerframe(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mac_data_bytes_num_perframe_
-                                     : this->dl_mac_data_bytes_num_perframe_;
-  }
-  inline size_t MacBytesNumPerframe(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mac_bytes_num_perframe_
-                                     : this->dl_mac_bytes_num_perframe_;
-  }
-
-  inline size_t MacPacketLength(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mac_packet_length_
-                                     : this->dl_mac_packet_length_;
-  }
-  inline size_t MacPayloadMaxLength(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mac_data_length_max_
-                                     : this->dl_mac_data_length_max_;
-  }
-  inline size_t MacPacketsPerframe(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mac_packets_perframe_
-                                     : this->dl_mac_packets_perframe_;
-  }
-  inline const LDPCconfig& LdpcConfig(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_ldpc_config_
-                                     : this->dl_ldpc_config_;
-  }
-  inline const LDPCconfig& BcLdpcConfig() const {
-    return dl_bcast_ldpc_config_;
-  }
-  inline size_t BcModOrderBits() const {
-    return this->dl_bcast_mod_order_bits_;
-  }
-  inline Table<complex_float>& ModTable(Direction dir) {
-    return dir == Direction::kUplink ? this->ul_mod_table_
-                                     : this->dl_mod_table_;
-  }
-  inline const nlohmann::json& MCSParams(Direction dir) const {
+  inline bool ScrambleEnabled() const { return this->scramble_enabled_; }
+  inline const nlohmann::json& DefaultMCSParams(Direction dir) const {
     return dir == Direction::kUplink ? this->ul_mcs_params_
                                      : this->dl_mcs_params_;
   }
-  inline size_t SubcarrierPerCodeBlock(Direction dir) const {
-    return this->LdpcConfig(dir).NumCbCodewLen() / this->ModOrderBits(dir);
-  }
-  inline size_t McsIndex(Direction dir) const {
-    return dir == Direction::kUplink ? this->ul_mcs_index_
-                                     : this->dl_mcs_index_;
-  }
-
-  inline bool ScrambleEnabled() const { return this->scramble_enabled_; }
+  inline const MacUtils& MacParams() const { return this->mac_params_; }
 
   inline std::string UeServerAddr() const { return this->ue_server_addr_; }
   inline std::string BsServerAddr() const { return this->bs_server_addr_; }
@@ -425,7 +368,6 @@ class Config {
     return this->beacon_ci16_;
   };
 
-  inline Table<int8_t>& UlBits() { return this->ul_bits_; }
   inline Table<int8_t>& DlModBits() { return this->dl_mod_bits_; }
   inline Table<int8_t>& UlModBits() { return this->ul_mod_bits_; }
   inline Table<complex_float>& UlIqF() { return this->ul_iq_f_; }
@@ -438,9 +380,6 @@ class Config {
   void LoadUplinkData();
   void LoadDownlinkData();
   void LoadTestVectors();
-  void UpdateUlMCS(const nlohmann::json& ul_mcs_params);
-  void UpdateDlMCS(const nlohmann::json& dl_mcs_params);
-  void UpdateCtrlMCS();
 
   /// Return total number of data symbols of all frames in a buffer
   /// that holds data of kFrameWnd frames
@@ -525,44 +464,6 @@ class Config {
                                        size_t frame_id, size_t sc_id) const {
     size_t frame_slot = frame_id % kFrameWnd;
     return &calib_buffer[frame_slot][sc_id * bs_ant_num_];
-  }
-
-  /// Get mac bits for this frame, symbol, user and code block ID
-  inline int8_t* GetMacBits(Table<int8_t>& info_bits, Direction dir,
-                            size_t frame_id, size_t symbol_id, size_t ue_id,
-                            size_t cb_id) const {
-    size_t mac_bytes_perframe;
-    size_t num_bytes_per_cb;
-    size_t mac_packet_length;
-    if (dir == Direction::kDownlink) {
-      mac_bytes_perframe = this->dl_mac_bytes_num_perframe_;
-      num_bytes_per_cb = this->dl_num_bytes_per_cb_;
-      mac_packet_length = this->dl_mac_packet_length_;
-    } else {
-      mac_bytes_perframe = this->ul_mac_bytes_num_perframe_;
-      num_bytes_per_cb = this->ul_num_bytes_per_cb_;
-      mac_packet_length = this->ul_mac_packet_length_;
-    }
-    return &info_bits[ue_id][(frame_id % kFrameWnd) * mac_bytes_perframe +
-                             symbol_id * mac_packet_length +
-                             cb_id * num_bytes_per_cb];
-  }
-
-  /// Get info bits for this symbol, user and code block ID
-  inline int8_t* GetInfoBits(Table<int8_t>& info_bits, Direction dir,
-                             size_t symbol_id, size_t ue_id,
-                             size_t cb_id) const {
-    size_t num_bytes_per_cb;
-    size_t num_blocks_in_symbol;
-    if (dir == Direction::kDownlink) {
-      num_bytes_per_cb = this->dl_num_bytes_per_cb_;
-      num_blocks_in_symbol = this->dl_ldpc_config_.NumBlocksInSymbol();
-    } else {
-      num_bytes_per_cb = this->ul_num_bytes_per_cb_;
-      num_blocks_in_symbol = this->ul_ldpc_config_.NumBlocksInSymbol();
-    }
-    return &info_bits[symbol_id][Roundup<64>(num_bytes_per_cb) *
-                                 (num_blocks_in_symbol * ue_id + cb_id)];
   }
 
   /// Get encoded_buffer for this frame, symbol, user and code block ID
@@ -731,7 +632,6 @@ class Config {
   void Print() const;
   nlohmann::json Parse(const nlohmann::json& in_json,
                        const std::string& json_handle);
-  void DumpMcsInfo();
 
   /* Class constants */
   inline static const size_t kDefaultSymbolNumPerFrame = 70;
@@ -740,11 +640,6 @@ class Config {
   inline static const size_t kDefaultULSymStart = 9;
   inline static const size_t kDefaultDLSymPerFrame = 30;
   inline static const size_t kDefaultDLSymStart = 40;
-
-  // Number of code blocks per OFDM symbol
-  // Temporarily set to 1
-  // TODO: This number should independent of OFDM symbols
-  static constexpr size_t kCbPerSymbol = 1;
 
   /* Private class variables */
   const double freq_ghz_;  // RDTSC frequency in GHz
@@ -787,32 +682,17 @@ class Config {
 
   size_t ofdm_pilot_spacing_;
 
-  std::string ul_modulation_;  // Modulation order as a string, e.g., "16QAM"
-  size_t
-      ul_mod_order_bits_;  // Number of binary bits used for a modulation order
-  std::string dl_modulation_;
-  size_t dl_mod_order_bits_;
-  size_t dl_bcast_mod_order_bits_;
-
-  // Modulation lookup table for mapping binary bits to constellation points
-  Table<complex_float> ul_mod_table_;
-  Table<complex_float> dl_mod_table_;
-
-  LDPCconfig ul_ldpc_config_;        // Uplink LDPC parameters
-  LDPCconfig dl_ldpc_config_;        // Downlink LDPC parameters
-  LDPCconfig dl_bcast_ldpc_config_;  // Downlink Broadcast LDPC parameters
-  nlohmann::json ul_mcs_params_;     // Uplink Modulation and Coding (MCS)
-  nlohmann::json dl_mcs_params_;     // Downlink Modulation and Coding (MCS)
-  size_t ul_mcs_index_;
-  size_t dl_mcs_index_;
-  size_t dl_code_rate_;
-  size_t ul_code_rate_;
   bool scramble_enabled_;
+
+  nlohmann::json ul_mcs_params_;  // Uplink Modulation and Coding (MCS)
+  nlohmann::json dl_mcs_params_;  // Downlink Modulation and Coding (MCS)
 
   // A class that holds the frame configuration the id contains letters
   // representing the symbol types in the frame (e.g., 'P' for pilot symbols,
   // 'U' for uplink data symbols)
   FrameStats frame_;
+
+  MacUtils mac_params_;
 
   std::atomic<bool> running_;
 
@@ -824,7 +704,6 @@ class Config {
   std::vector<size_t> dl_symbol_data_id_;
   std::vector<size_t> dl_symbol_ctrl_id_;
 
-  Table<int8_t> ul_bits_;
   Table<int8_t> ul_mod_bits_;
   Table<int8_t> dl_mod_bits_;
   Table<complex_float> dl_iq_f_;
@@ -991,42 +870,6 @@ class Config {
 
   bool bigstation_mode_;  // If true, use pipeline-parallel scheduling
 
-  // The total number of uncoded uplink data bytes in each OFDM symbol
-  size_t ul_data_bytes_num_persymbol_;
-
-  // The total number of uplink MAC payload data bytes in each Frame
-  size_t ul_mac_data_bytes_num_perframe_;
-
-  // The total number of uplink MAC packet bytes in each Frame
-  size_t ul_mac_bytes_num_perframe_;
-
-  // The length (in bytes) of a uplink MAC packet including the header
-  size_t ul_mac_packet_length_;
-
-  // The length (in bytes) of a uplink MAC packet payload (data)
-  size_t ul_mac_data_length_max_;
-
-  // The total number of uncoded downlink data bytes in each OFDM symbol
-  size_t dl_data_bytes_num_persymbol_;
-
-  // The total number of downlink MAC payload data bytes in each Frame
-  size_t dl_mac_data_bytes_num_perframe_;
-
-  // The total number of downlink MAC packet bytes in each Frame
-  size_t dl_mac_bytes_num_perframe_;
-
-  // The length (in bytes) of a downlink MAC packet including the header
-  size_t dl_mac_packet_length_;
-
-  // The length (in bytes) of a downlink MAC packet payload (data)
-  size_t dl_mac_data_length_max_;
-
-  // The total number of downlink mac packets sent/received in each frame
-  size_t dl_mac_packets_perframe_;
-
-  // The total number of uplink mac packets sent/received in each frame
-  size_t ul_mac_packets_perframe_;
-
   // IP address of the machine running the baseband processing for UE
   std::string ue_server_addr_;
 
@@ -1111,14 +954,6 @@ class Config {
   size_t transport_block_size_;
 
   float noise_level_;
-
-  // Number of bytes per code block
-  size_t ul_num_bytes_per_cb_;
-  size_t dl_num_bytes_per_cb_;
-
-  // Number of padding bytes per code block
-  size_t ul_num_padding_bytes_per_cb_;
-  size_t dl_num_padding_bytes_per_cb_;
 
   const std::string config_filename_;
   std::string trace_file_;

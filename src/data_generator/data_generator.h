@@ -145,6 +145,9 @@ class DataGenerator {
   static void GenerateUlTxTestVectors(Config* const cfg);
   static void GenerateDlTxTestVectors(Config* const cfg,
                                       Table<complex_float>& dmrs);
+  static void WriteUlScDataToFile(
+      const Config* const cfg, const std::string& directory,
+      const std::vector<std::vector<int8_t>>& ul_encoded_codewords);
 
  private:
   FastRand fast_rand_;  // A fast random number generator

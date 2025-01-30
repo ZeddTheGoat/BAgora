@@ -122,7 +122,7 @@ void DatasetModel::InstantiateDataset(const std::string& dataset_path) {
       dataset_path.c_str(), frames_num, scs_num, bss_num, ues_num);
 }
 
-void DatasetModel::UpdateModel(const float mean_channel_gain) {
+void DatasetModel::UpdateModel() {
   if (kLoopDataset) {
     current_frame_num_ = current_frame_num_ % max_frame_num_;
   }
