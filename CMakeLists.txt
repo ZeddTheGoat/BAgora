@@ -412,6 +412,8 @@ set(COMMON_SOURCES
   src/common/crc.cc
   src/common/memory_manage.cc
   src/common/scrambler.cc
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc
   src/agora/radio/radio.cc
   src/agora/radio/radio_soapysdr.cc
   src/agora/radio/radio_data_plane.cc
