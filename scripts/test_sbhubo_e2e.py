@@ -257,6 +257,12 @@ def main(argv: Iterable[str]) -> int:
         default=19,
         help="Core offset parameter for chsim (default: %(default)s)",
     )
+    parser.add_argument(
+        "--chsim-snr",
+        type=float,
+        default=20.0,
+        help="Downlink/uplink SNR in dB passed to chsim (default: %(default)s)",
+    )
     args = parser.parse_args(list(argv))
 
     build_dir = args.build_dir.resolve()
@@ -309,6 +315,8 @@ def main(argv: Iterable[str]) -> int:
                     str(args.chsim_worker_threads),
                     "--core_offset",
                     str(args.chsim_core_offset),
+                    "--chan_snr",
+                    f"{args.chsim_snr}",
                     "--conf_file",
                     tmp_config,
                 ],

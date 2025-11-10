@@ -27,6 +27,7 @@ script configures and builds the required executables (`data_generator`, `user`,
 | `--chsim-ue-threads` | Number of UE threads for the channel simulator. |
 | `--chsim-worker-threads` | Number of worker threads for the channel simulator. |
 | `--chsim-core-offset` | Core offset passed to the channel simulator. |
+| `--chsim-snr` | Channel SNR in dB supplied to the simulator (higher is cleaner). |
 
 Run `python3 scripts/test_sbhubo_e2e.py --help` to see the full list, including
 build-related switches such as `--build-dir` and `--generator`.
