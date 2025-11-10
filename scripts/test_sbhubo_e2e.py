@@ -132,7 +132,7 @@ def terminate_process(proc: subprocess.Popen, *, graceful: bool = True) -> None:
 
 def extract_ul_records(log_path: Path) -> Dict[int, Tuple[int, int, float]]:
     pattern = re.compile(
-        r"UE\s+(\d+):\s+UL bit errors \(BER\)\s+(\d+)/(\d+)\s+\(([0-9.eE+-]+)\)"
+        r"UE\s+(\d+):\s+(?:UL|Uplink) bit errors \(BER\)\s+(\d+)/(\d+)\s+\(([0-9.eE+-]+)\)"
     )
     records: Dict[int, Tuple[int, int, float]] = {}
     for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
