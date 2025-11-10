@@ -18,7 +18,7 @@ LOG_PREFIX = "[test_sbhubo_e2e]"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUILD_DIR = REPO_ROOT / "build"
 CONFIG_TEMPLATE = REPO_ROOT / "files" / "config" / "ci" / "chsim.json"
-LOG_DIR = REPO_ROOT / "files" / "log"
+DEFAULT_LOG_DIR = REPO_ROOT / "files" / "log"
 
 
 class CommandError(RuntimeError):
@@ -152,7 +152,7 @@ def validate_results(
     user_log: Path,
     ue_count: int,
     threshold: float,
-) -> None:
+) -> Dict[int, Tuple[int, int, float]]:
     agora_records = extract_ul_records(agora_log)
     user_records = extract_ul_records(user_log)
 
@@ -165,6 +165,7 @@ def validate_results(
             f"Expected {ue_count} UL BER records in UE log, found {len(user_records)}"
         )
 
+    summary: Dict[int, Tuple[int, int, float]] = {}
     for ue in range(ue_count):
         if ue not in agora_records:
             raise CommandError(f"Missing UE {ue} record in Agora log")
@@ -185,6 +186,8 @@ def validate_results(
                 raise CommandError(
                     f"{source} reported {errors} bit errors for UE {ue} (expected 0)"
                 )
+        summary[ue] = agora_records[ue]
+    return summary
 
 
 def main(argv: Iterable[str]) -> int:
@@ -219,6 +222,41 @@ def main(argv: Iterable[str]) -> int:
         action="store_true",
         help="Preserve generated log files instead of deleting them",
     )
+    parser.add_argument(
+        "--show-ber",
+        action="store_true",
+        help="Print per-UE UL BER after the run succeeds",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=DEFAULT_LOG_DIR,
+        help="Directory for log files (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--chsim-bs-threads",
+        type=int,
+        default=1,
+        help="Number of base-station threads to pass to chsim (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--chsim-ue-threads",
+        type=int,
+        default=1,
+        help="Number of UE threads to pass to chsim (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--chsim-worker-threads",
+        type=int,
+        default=4,
+        help="Number of worker threads to pass to chsim (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--chsim-core-offset",
+        type=int,
+        default=19,
+        help="Core offset parameter for chsim (default: %(default)s)",
+    )
     args = parser.parse_args(list(argv))
 
     build_dir = args.build_dir.resolve()
@@ -233,10 +271,11 @@ def main(argv: Iterable[str]) -> int:
         env = os.environ.copy()
         env.setdefault("AGORA_LOG_LEVEL", "info")
 
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        user_log = LOG_DIR / "sbhubo_user.log"
-        chsim_log = LOG_DIR / "sbhubo_chsim.log"
-        agora_log = LOG_DIR / "sbhubo_agora.log"
+        log_dir = args.log_dir.resolve()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        user_log = log_dir / "sbhubo_user.log"
+        chsim_log = log_dir / "sbhubo_chsim.log"
+        agora_log = log_dir / "sbhubo_agora.log"
 
         processes: list[subprocess.Popen] = []
         log_handles: list[TextIO] = []
@@ -263,13 +302,13 @@ def main(argv: Iterable[str]) -> int:
                 [
                     build_dir / "chsim",
                     "--bs_threads",
-                    "1",
+                    str(args.chsim_bs_threads),
                     "--ue_threads",
-                    "1",
+                    str(args.chsim_ue_threads),
                     "--worker_threads",
-                    "4",
+                    str(args.chsim_worker_threads),
                     "--core_offset",
-                    "19",
+                    str(args.chsim_core_offset),
                     "--conf_file",
                     tmp_config,
                 ],
@@ -312,8 +351,16 @@ def main(argv: Iterable[str]) -> int:
             for handle in log_handles:
                 handle.flush()
 
-            validate_results(agora_log, user_log, ue_count, args.ber_threshold)
+            summary = validate_results(agora_log, user_log, ue_count, args.ber_threshold)
+            if args.show_ber:
+                for ue in sorted(summary):
+                    errors, total, ber = summary[ue]
+                    log(f"UE {ue}: {errors} errors / {total} bits -> BER {ber:.3e}")
             log("SB-HUBO end-to-end simulation passed BER checks")
+            if args.keep_logs:
+                log(f"Logs retained in {log_dir}")
+            else:
+                log("Logs were removed; pass --keep-logs to preserve them")
         finally:
             for proc in processes:
                 terminate_process(proc, graceful=False)
