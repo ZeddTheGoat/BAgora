@@ -430,6 +430,10 @@ set(COMMON_SOURCES
   src/encoder/iobuffer.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
 
+list(APPEND COMMON_SOURCES
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc)
+
 set(SHARED_TXRX_SOURCES
   src/agora/txrx/packet_txrx.cc
   src/agora/txrx/workers/txrx_worker.cc)
