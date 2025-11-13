@@ -32,7 +32,7 @@ class ChannelSim {
              size_t user_thread_num, size_t worker_thread_num,
              size_t in_core_offset = 30,
              std::string in_chan_type = std::string("RAYLEIGH"),
-             double in_chan_snr = 20);
+             std::string dataset_path = std::string(""));
   ~ChannelSim();
 
   void Run();
@@ -98,7 +98,7 @@ class ChannelSim {
   std::vector<std::thread> task_threads_;
 
   size_t ul_data_plus_pilot_symbols_;
-  size_t dl_data_plus_beacon_symbols_;
+  size_t dl_data_plus_bcast_symbols_;
   size_t payload_length_;
 
   size_t bs_thread_num_;
@@ -109,7 +109,7 @@ class ChannelSim {
   size_t core_offset_;
 
   std::string channel_type_;
-  double channel_snr_;
+  std::string dataset_path_;
 
   TimeFrameCounters ue_rx_;
   TimeFrameCounters ue_tx_;

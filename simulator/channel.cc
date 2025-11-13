@@ -1,100 +1,81 @@
 /**
- * @file channel.h
+ * @file channel.cc
  * @brief Implementation file for the channel class
  */
 #include "channel.h"
 
-#include <utility>
+#include "armadillo"
+#include "logger.h"
+#include "utils.h"
 
 static constexpr bool kPrintChannelOutput = false;
 static constexpr bool kPrintSNRCheck = false;
-static constexpr double kMeanChannelGain = 0.1f;
-
-Channel::Channel(const Config* const config, std::string& in_channel_type,
-                 double in_channel_snr)
-    : cfg_(config),
-      sim_chan_model_(std::move(in_channel_type)),
-      channel_snr_db_(in_channel_snr) {
-  bs_ant_ = cfg_->BsAntNum();
-  ue_ant_ = cfg_->UeAntNum();
-  n_samps_ = cfg_->SampsPerSymbol();
-
-  if (sim_chan_model_ == "AWGN") {
-    chan_model_ = kAwgn;
-  } else if (sim_chan_model_ == "RAYLEIGH") {
-    chan_model_ = kRayleigh;
-  } else if (sim_chan_model_ == "RAN_3GPP") {
-    chan_model_ = kRan3Gpp;
-    printf("3GPP Model in progress, setting to RAYLEIGH channel \n");
-    chan_model_ = kRayleigh;
-  } else {
-    chan_model_ = kAwgn;
-  }
-  float snr_lin = std::pow(10, channel_snr_db_ / 10.0f);
-  noise_samp_std_ = std::sqrt(kMeanChannelGain / (snr_lin * 2.0f));
-  std::cout << "Noise level to be used is: " << std::fixed << std::setw(5)
-            << std::setprecision(2) << noise_samp_std_ << std::endl;
-}
 
 Channel::~Channel() = default;
+
+Channel::Channel(const Config* const config, std::string& in_channel_type,
+                 std::string& dataset_path)
+    : cfg_(config), sim_chan_model_(std::move(in_channel_type)) {
+  channel_model_ = std::move(
+      ChannelModel::CreateChannelModel(cfg_, sim_chan_model_, dataset_path));
+
+  noise_samp_std_ = config->NoiseLevel() / std::sqrt(2);
+
+  std::cout << "Noise level to be used is: " << std::fixed << std::setw(5)
+            << std::setprecision(3) << noise_samp_std_ << std::endl;
+}
 
 void Channel::ApplyChan(const arma::cx_fmat& fmat_src, arma::cx_fmat& fmat_dst,
                         const bool is_downlink, const bool is_newChan) {
   arma::cx_fmat fmat_h;
 
   if (is_newChan) {
-    switch (chan_model_) {
-      case kAwgn: {
-        arma::fmat rmat(ue_ant_, bs_ant_, arma::fill::ones);
-        arma::fmat imat(ue_ant_, bs_ant_, arma::fill::zeros);
-        h_ = arma::cx_fmat(rmat, imat);
-        // H = H / abs(H).max();
-      } break;
-
-      case kRayleigh:
-        // Simple Uncorrelated Rayleigh Channel - Flat fading (single tap)
-        {
-          arma::fmat rmat(ue_ant_, bs_ant_, arma::fill::randn);
-          arma::fmat imat(ue_ant_, bs_ant_, arma::fill::randn);
-          h_ = arma::cx_fmat(rmat, imat);
-          h_ = sqrt(kMeanChannelGain / 2.0f) * h_;
-          // H = H / abs(H).max();
-        }
-        break;
-
-      case kRan3Gpp:
-        Lte3gpp(fmat_src, fmat_dst);
-        break;
-    }
+    channel_model_->UpdateModel();
   }
-  if (is_downlink) {
-    fmat_h = fmat_src * h_.st();
-  } else {
-    fmat_h = fmat_src * h_;
+
+  switch (channel_model_->GetFadingType()) {
+    case ChannelModel::kFlat: {
+      fmat_h = fmat_src * channel_model_->GetMatrix(is_downlink);
+      break;
+    }
+
+    case ChannelModel::kSelective: {
+      const size_t n_rows = (cfg_->FreqDomainChannel())
+                                ? cfg_->OfdmCaNum()
+                                : cfg_->SampsPerSymbol();
+      const size_t n_cols = (is_downlink) ? cfg_->UeAntNum() : cfg_->BsAntNum();
+
+      fmat_h.zeros(n_rows, n_cols);
+      for (size_t h_index = 0; h_index < n_rows; h_index++) {
+        fmat_h.row(h_index) = fmat_src.row(h_index) *
+                              channel_model_->GetMatrix(is_downlink, h_index);
+      }
+      break;
+    }
+
+    default: {
+      AGORA_LOG_ERROR("Invalid Channel model fading type \n");
+      break;
+    }
   }
 
   // Add noise
   Awgn(fmat_h, fmat_dst);
 
   if (kPrintChannelOutput) {
-    Utils::PrintMat(h_, "H");
+    Utils::PrintMat(fmat_dst, "H");
   }
 }
 
 void Channel::Awgn(const arma::cx_fmat& src, arma::cx_fmat& dst) const {
-  if (channel_snr_db_ < 120.0f) {
+  if (cfg_->NoiseLevel() < 0.0001f) {
     const int n_row = src.n_rows;
     const int n_col = src.n_cols;
 
     // Generate noise
     arma::cx_fmat noise(arma::randn<arma::fmat>(n_row, n_col),
                         arma::randn<arma::fmat>(n_row, n_col));
-    // Supposed to be faster
-    // arma::fmat x(n_row, n_col, arma::fill::arma::randn);
-    // arma::fmat y(n_row, n_col, arma::fill::arma::randn);
-    // arma::cx_fmat noise = arma::cx_fmat(x, y);
 
-    // Add noise to signal
     noise *= noise_samp_std_;
     dst = src + noise;
 
@@ -110,12 +91,4 @@ void Channel::Awgn(const arma::cx_fmat& src, arma::cx_fmat& dst) const {
   } else {
     dst = src;
   }
-}
-
-void Channel::Lte3gpp(const arma::cx_fmat& fmat_src, arma::cx_fmat& fmat_dst) {
-  // TODO - In progress (Use Rayleigh for now...)
-  arma::cx_fmat h(arma::randn<arma::fmat>(cfg_->UeAntNum(), cfg_->BsAntNum()),
-                  arma::randn<arma::fmat>(cfg_->UeAntNum(), cfg_->BsAntNum()));
-  h = (1 / sqrt(2)) * h;
-  fmat_dst = fmat_src * h;
 }

@@ -8,6 +8,7 @@
 #include "concurrent_queue_wrapper.h"
 #include "csv_logger.h"
 #include "dobeamweights.h"
+#include "dobroadcast.h"
 #include "dodecode.h"
 #include "dodemul.h"
 #include "doencode.h"
@@ -16,46 +17,48 @@
 #include "doprecode.h"
 #include "logger.h"
 
-AgoraWorker::AgoraWorker(Config* cfg, Stats* stats, PhyStats* phy_stats,
-                         MessageInfo* message, AgoraBuffer* buffer,
-                         FrameInfo* frame)
-    : base_worker_core_offset_(cfg->CoreOffset() + 1 + cfg->SocketThreadNum()),
-      config_(cfg),
+AgoraWorker::AgoraWorker(Config* cfg, MacScheduler* mac_sched, Stats* stats,
+                         PhyStats* phy_stats, MessageInfo* message,
+                         AgoraBuffer* buffer, FrameInfo* frame,
+                         size_t worker_id, size_t core_id)
+    : config_(cfg),
+      enabled_(false),
+      worker_id_(worker_id),
+      core_id_(core_id),
+      mac_sched_(mac_sched),
       stats_(stats),
       phy_stats_(phy_stats),
       message_(message),
       buffer_(buffer),
       frame_(frame) {
-  CreateThreads();
+  AGORA_LOG_SYMBOL("Worker: Starting worker thread %zu at core %zu\n",
+                   worker_id, core_id_);
+  const auto system_cores = sysconf(_SC_NPROCESSORS_ONLN);
+  if (core_id_ > static_cast<size_t>(system_cores)) {
+    throw std::runtime_error("Worker core exceeds the system core count!!");
+  }
+  enabled_.store(true);
+  thread_ = std::thread(&AgoraWorker::WorkLoop, this);
 }
 
 AgoraWorker::~AgoraWorker() {
-  for (auto& worker_thread : workers_) {
-    AGORA_LOG_SYMBOL("Agora: Joining worker thread\n");
-    if (worker_thread.joinable()) {
-      worker_thread.join();
-    }
+  AGORA_LOG_SYMBOL("Agora: Joining worker thread %zu\n", core_id_);
+  if (thread_.joinable()) {
+    thread_.join();
   }
 }
 
-void AgoraWorker::CreateThreads() {
-  AGORA_LOG_SYMBOL("Worker: creating %zu workers\n",
-                   config_->WorkerThreadNum());
-  for (size_t i = 0; i < config_->WorkerThreadNum(); i++) {
-    workers_.emplace_back(&AgoraWorker::WorkerThread, this, i);
-  }
-}
-
-void AgoraWorker::WorkerThread(int tid) {
-  PinToCoreWithOffset(ThreadType::kWorker, base_worker_core_offset_, tid);
+void AgoraWorker::WorkLoop() {
+  PinToCoreWithOffset(ThreadType::kWorker, 0, core_id_);
+  const size_t tid = worker_id_;
 
   /* Initialize operators */
   auto compute_beam = std::make_unique<DoBeamWeights>(
       config_, tid, buffer_->GetCsi(), buffer_->GetCalibDl(),
       buffer_->GetCalibUl(), buffer_->GetCalibDlMsum(),
       buffer_->GetCalibUlMsum(), buffer_->GetCalib(),
-      buffer_->GetUlBeamMatrix(), buffer_->GetDlBeamMatrix(), phy_stats_,
-      stats_);
+      buffer_->GetUlBeamMatrix(), buffer_->GetDlBeamMatrix(), mac_sched_,
+      phy_stats_, stats_);
 
   auto compute_fft = std::make_unique<DoFFT>(
       config_, tid, buffer_->GetFft(), buffer_->GetCsi(), buffer_->GetCalibDl(),
@@ -67,22 +70,24 @@ void AgoraWorker::WorkerThread(int tid) {
 
   auto compute_precode = std::make_unique<DoPrecode>(
       config_, tid, buffer_->GetDlBeamMatrix(), buffer_->GetIfft(),
-      buffer_->GetDlModBits(), stats_);
+      buffer_->GetDlModBits(), mac_sched_, stats_);
 
   auto compute_encoding = std::make_unique<DoEncode>(
-      config_, tid, Direction::kDownlink,
-      (kEnableMac == true) ? buffer_->GetDlBits() : config_->DlBits(),
-      (kEnableMac == true) ? kFrameWnd : 1, buffer_->GetDlModBits(), stats_);
+      config_, tid, Direction::kDownlink, buffer_->GetDlBits(),
+      buffer_->GetDlModBits(), mac_sched_, stats_);
 
   // Uplink workers
-  auto compute_decoding =
-      std::make_unique<DoDecode>(config_, tid, buffer_->GetDemod(),
-                                 buffer_->GetDecod(), phy_stats_, stats_);
+  auto compute_decoding = std::make_unique<DoDecode>(
+      config_, tid, buffer_->GetDemod(), buffer_->GetDecod(), mac_sched_,
+      phy_stats_, stats_);
 
   auto compute_demul = std::make_unique<DoDemul>(
       config_, tid, buffer_->GetFft(), buffer_->GetUlBeamMatrix(),
       buffer_->GetUeSpecPilot(), buffer_->GetEqual(), buffer_->GetDemod(),
-      phy_stats_, stats_);
+      mac_sched_, phy_stats_, stats_);
+
+  auto compute_bcast = std::make_unique<DoBroadcast>(
+      config_, tid, buffer_->GetDlSocket(), stats_);
 
   std::vector<Doer*> computers_vec;
   std::vector<EventType> events_vec;
@@ -99,6 +104,11 @@ void AgoraWorker::WorkerThread(int tid) {
     events_vec.push_back(EventType::kDemul);
   }
 
+  if (config_->Frame().NumDlControlSyms() > 0) {
+    computers_vec.push_back(compute_bcast.get());
+    events_vec.push_back(EventType::kBroadcast);
+  }
+
   if (config_->Frame().NumDLSyms() > 0) {
     computers_vec.push_back(compute_ifft.get());
     computers_vec.push_back(compute_precode.get());
@@ -111,13 +121,41 @@ void AgoraWorker::WorkerThread(int tid) {
   size_t cur_qid = 0;
   size_t empty_queue_itrs = 0;
   bool empty_queue = true;
-  while (config_->Running() == true) {
+  while ((config_->Running() == true) && (enabled_.load() == true)) {
     for (size_t i = 0; i < computers_vec.size(); i++) {
       if (computers_vec.at(i)->TryLaunch(
               *message_->GetConq(events_vec.at(i), cur_qid),
               message_->GetCompQueue(cur_qid),
               message_->GetWorkerPtok(cur_qid, tid))) {
         empty_queue = false;
+
+        if (((computers_vec.at(i)->enq_deq_tsc_worker_.frame_id_ ==
+              config_->FrameToProfile()) and
+             (cur_qid ==
+              (computers_vec.at(i)->enq_deq_tsc_worker_.frame_id_ & 0x1)))) {
+          size_t symbol_id =
+              computers_vec.at(i)->enq_deq_tsc_worker_.symbol_id_;
+          if (symbol_id > config_->Frame().NumTotalSyms()) {
+            symbol_id = 0;  // kBeam event does not have a valid symbol_id
+          }
+
+          stats_->LogDequeueStatsWorker(
+              tid, computers_vec.at(i)->enq_deq_tsc_worker_.frame_id_,
+              symbol_id,
+              computers_vec.at(i)->enq_deq_tsc_worker_.dequeue_start_tsc_,
+              computers_vec.at(i)->enq_deq_tsc_worker_.dequeue_end_tsc_,
+              computers_vec.at(i)->enq_deq_tsc_worker_.dequeue_diff_tsc_,
+              computers_vec.at(i)->enq_deq_tsc_worker_.valid_dequeue_diff_tsc_,
+              events_vec.at(i));
+
+          stats_->LogEnqueueStatsWorker(
+              tid, computers_vec.at(i)->enq_deq_tsc_worker_.frame_id_,
+              symbol_id,
+              computers_vec.at(i)->enq_deq_tsc_worker_.enqueue_start_tsc_,
+              computers_vec.at(i)->enq_deq_tsc_worker_.enqueue_end_tsc_,
+              computers_vec.at(i)->enq_deq_tsc_worker_.enqueue_diff_tsc_,
+              events_vec.at(i));
+        }
         break;
       }
     }
@@ -137,5 +175,8 @@ void AgoraWorker::WorkerThread(int tid) {
       empty_queue = true;
     }
   }
-  AGORA_LOG_SYMBOL("Agora worker %d exit\n", tid);
+
+  // Clean exit??? ptoks? queues empty?
+  enabled_.store(false);
+  AGORA_LOG_INFO("Agora worker %d at core %zu exit\n", worker_id_, core_id_);
 }

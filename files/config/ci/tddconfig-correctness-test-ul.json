@@ -5,8 +5,7 @@
   "bs_radio_num": 8,
   "ue_radio_num": 8,
   "ul_mcs" : {
-    "modulation": "64QAM",
-    "code_rate": 0.333
+    "mcs_index" : 17 /*64QAM, 438/1024*/
   },
   "symbol_num_perframe": 70,
   "client_ul_pilot_syms": 0,
@@ -19,5 +18,5 @@
   "worker_thread_num": 1,
   "socket_thread_num": 1,
   "max_frame": 1,
-  "noise_level": 0.01
+  "noise_level": 0.001
 }

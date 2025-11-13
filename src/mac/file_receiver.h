@@ -6,6 +6,7 @@
 #define FILE_RECEIVER_H_
 
 #include <array>
+#include <cstdint>
 #include <fstream>
 #include <ios>
 #include <iostream>
@@ -31,8 +32,8 @@ class FileReceiver : public MacDataReceiver {
   std::ifstream data_stream_;
   std::array<uint8_t, FileReceiver::kFileStreamLocalRxBufSize> local_rx_buffer_;
 
-  size_t data_available_;
-  size_t data_start_offset_;
+  size_t data_available_{0};
+  size_t data_start_offset_{0};
 };
 
 #endif  // FILE_RECEIVER_H_

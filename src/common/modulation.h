@@ -39,23 +39,23 @@ static const std::map<std::string, size_t> kModulStringMap{
 static inline std::string MapModToStr(size_t mod_order) {
   switch (mod_order) {
     case 1:
-      return std::string("BPSK");
+      return {"BPSK"};
     case 2:
-      return std::string("QPSK");
+      return {"QPSK"};
     case 4:
-      return std::string("16QAM");
+      return {"16QAM"};
     case 6:
-      return std::string("64QAM");
+      return {"64QAM"};
     case 8:
-      return std::string("256QAM");
+      return {"256QAM"};
     case 10:
-      return std::string("1024QAM");
+      return {"1024QAM"};
     default:
-      return std::string("UNKNOWN!");
+      return {"UNKNOWN!"};
   }
 }
 
-void InitModulationTable(Table<complex_float>& table, size_t mod_order);
+void InitModulationTable(Table<complex_float>& table, size_t mod_order_bits);
 void InitQpskTable(Table<complex_float>& table);
 void InitQam16Table(Table<complex_float>& table);
 void InitQam64Table(Table<complex_float>& table);
@@ -99,5 +99,7 @@ void Demod256qamSoftAvx2(const float* vec_in, int8_t* llr, int num);
 void Demod256qamSoftAvx512(const float* vec_in, int8_t* llr, int num);
 #endif
 void Print256Epi8(__m256i var);
+void Demodulate(float* equal_ptr, int8_t* demod_ptr, size_t data_num,
+                size_t mod, bool hard_demod);
 
 #endif  // MODULATION_H_

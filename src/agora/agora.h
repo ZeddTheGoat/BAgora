@@ -15,14 +15,16 @@
 #include <vector>
 
 #include "agora_buffer.h"
-#include "agora_worker.h"
+#include "agora_worker_set.h"
 #include "concurrentqueue.h"
+#include "mac_scheduler.h"
 #include "mac_thread_basestation.h"
 #include "message.h"
 #include "packet_txrx.h"
 #include "phy_stats.h"
 #include "ran_config.h"
 #include "recorder_thread.h"
+#include "resource_provisioner_thread.h"
 #include "stats.h"
 #include "symbols.h"
 
@@ -70,6 +72,9 @@ class Agora {
   size_t FetchEvent(std::vector<EventData>& events_list,
                     bool is_turn_to_dequeue_from_io);
 
+  /// Dynamically (de)allocate cores during runtime
+  void UpdateCores(RPControlMsg rcm);
+
   void InitializeQueues();
   void InitializeCounters();
   void InitializeThreads();
@@ -79,7 +84,7 @@ class Agora {
   void SaveTxDataToFile(int frame_id);
 
   void HandleEventFft(size_t tag);
-  void UpdateRxCounters(size_t frame_id, size_t symbol_id);
+  void UpdateRxCounters(size_t frame_id, size_t symbol_id, size_t ant_id);
 
   /// Update Agora's RAN config parameters
   void UpdateRanConfig(RanConfig rc);
@@ -90,6 +95,7 @@ class Agora {
                         size_t symbol_id);
   void ScheduleAntennasTX(size_t frame_id, size_t symbol_id);
   void ScheduleDownlinkProcessing(size_t frame_id);
+  void ScheduleDownlinkMAC(size_t frame_id);
 
   /**
    * @brief Schedule LDPC decoding or encoding over code blocks
@@ -102,6 +108,7 @@ class Agora {
                           size_t symbol_idx);
 
   void ScheduleUsers(EventType event_type, size_t frame_id, size_t symbol_id);
+  void ScheduleBroadCastSymbols(EventType event_type, size_t frame_id);
 
   // Send current frame's SNR measurements from PHY to MAC
   void SendSnrReport(EventType event_type, size_t frame_id, size_t symbol_id);
@@ -119,9 +126,14 @@ class Agora {
   // Handle for the MAC thread
   std::thread mac_std_thread_;
 
+  // The thread running RP thread functions
+  std::unique_ptr<ResourceProvisionerThread> rp_thread_;
+  std::thread rp_std_thread_;
+
+  std::unique_ptr<MacScheduler> mac_sched_;
   std::unique_ptr<Stats> stats_;
   std::unique_ptr<PhyStats> phy_stats_;
-  std::unique_ptr<AgoraWorker> worker_set_;
+  std::unique_ptr<AgoraWorkerSet> worker_set_;
 
   //Agora Buffer containment
   std::unique_ptr<AgoraBuffer> agora_memory_;
@@ -174,6 +186,13 @@ class Agora {
 
   // Worker-to-master queue for MAC
   moodycamel::ConcurrentQueue<EventData> mac_response_queue_;
+
+  //moodycamel::ProducerToken* mac_request_ptok_ptr_;
+  //moodycamel::ProducerToken* mac_response_ptok_ptr_;
+
+  // Resource Provisioner queue
+  moodycamel::ConcurrentQueue<EventData> rp_request_queue_;
+  moodycamel::ConcurrentQueue<EventData> rp_response_queue_;
 
   moodycamel::ProducerToken* rx_ptoks_ptr_[kMaxThreads];
   moodycamel::ProducerToken* tx_ptoks_ptr_[kMaxThreads];

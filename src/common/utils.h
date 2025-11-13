@@ -41,6 +41,12 @@ void PinToCoreWithOffset(ThreadType thread, size_t base_core_offset,
                          size_t thread_id, bool allow_reuse = false,
                          bool verbose = false);
 
+/* Remove core from core_list at (core_id + core_offset) */
+void RemoveCoreFromList(int core_id, int core_offset);
+
+/* Get the number of available cores in the machine */
+size_t GetAvailableCores();
+
 void PrintCoreAssignmentSummary();
 
 template <class T>
@@ -69,6 +75,12 @@ class Utils {
   static std::vector<uint32_t> Cfloat32ToUint32(
       const std::vector<std::complex<float>>& in, bool conj,
       const std::string& order);
+  static size_t Bits2Int(std::vector<uint8_t> in);
+  static size_t Bits2Int(arma::uvec in);
+  static size_t BitIndices2Int(arma::uvec in);
+  static arma::cx_frowvec Int2Bits(size_t in, size_t num_bits);
+  static arma::uvec BitOneIndices(size_t in, size_t num_bits);
+
   static std::vector<std::vector<size_t>> LoadSymbols(
       std::vector<std::string> const& frames, char sym);
   static void LoadDevices(std::string filename, std::vector<std::string>& data);
@@ -80,24 +92,27 @@ class Utils {
   static std::vector<std::string> Split(const std::string& s, char delimiter);
   static void PrintVector(const std::vector<std::complex<int16_t>>& data);
   static void WriteBinaryFile(const std::string& name, size_t elem_size,
-                              size_t buffer_size, void* buff);
+                              size_t buffer_size, void* buff,
+                              bool append = false);
+  static void ReadBinaryFile(const std::string& name, size_t elem_size,
+                             size_t buffer_size, size_t offset, void* buff);
   static void PrintVec(const arma::cx_fvec& c, const std::string& ss);
   static void SaveVec(const arma::cx_fvec& c, const std::string& filename,
                       const std::string& /*ss*/, const bool /*append*/);
   static void PrintMat(const arma::cx_fmat& c, const std::string& ss);
   static void SaveMat(const arma::cx_fmat& c, const std::string& filename,
                       const std::string& ss, const bool append);
-  static void WriteVector(const std::string filename, const std::string desc,
-                          const std::vector<int> vec_data);
-  static std::vector<int> ReadVector(const std::string filename,
+  static void WriteVector(const std::string& filename, const std::string& desc,
+                          const std::vector<int>& vec_data);
+  static std::vector<int> ReadVector(const std::string& filename,
                                      const bool skip_line);
   static void WriteVectorOfComplex(
-      const std::string filename, const std::string desc,
-      const std::array<std::vector<std::complex<double>>, kMaxChannels>
+      const std::string& filename, const std::string& desc,
+      const std::array<std::vector<std::complex<double>>, kMaxChannels>&
           vec_data);
   static std::array<std::vector<std::complex<double>>, kMaxChannels>
-  ReadVectorOfComplex(const std::string filename, const bool skip_line,
-                      const std::vector<size_t> present_channels);
+  ReadVectorOfComplex(const std::string& filename, const bool skip_line,
+                      const std::vector<size_t>& present_channels);
 };
 
 /// roundup<N>(x) returns x rounded up to the next multiple of N. N must be

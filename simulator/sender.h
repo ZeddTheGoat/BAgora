@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <iostream>
 #include <numeric>
 #include <thread>
@@ -74,17 +75,21 @@ class Sender {
   void* WorkerThread(int tid);
 
   /**
-   * @brief Read time-domain 32-bit floating-point IQ samples from [filename]
+   * @brief Read adapting UEs across frames and populate adapt_ues_array_
+  */
+  void InitUesFromFile();
+
+  /**
+   * @brief Read time-domain 32-bit floating-point IQ samples from [filepath]
    * and populate iq_data_short_ by converting to 16-bit fixed-point samples
    *
-   * [filename] must contain data for one frame. For every symbol and antenna,
-   * the file must provide (CP_LEN + OFDM_CA_NUM) IQ samples.
+   * [filepath] must contain path to the data file for one frame. For every
+   * symbol and antenna, the file must provide (CP_LEN + OFDM_CA_NUM) IQ samples.
    */
-  void InitIqFromFile(const std::string& filename);
+  void InitIqFromFilePath();
 
   // Get number of CPU ticks for a symbol given a frame index
   uint64_t GetTicksForFrame(size_t frame_id) const;
-  size_t GetMaxSymbolId() const;
 
   // Launch threads to run worker with thread IDs from tid_start to tid_end
   void CreateWorkerThreads(size_t num_workers);
@@ -132,6 +137,10 @@ class Sender {
   moodycamel::ConcurrentQueue<size_t> completion_queue_ =
       moodycamel::ConcurrentQueue<size_t>(1024);
   moodycamel::ProducerToken** task_ptok_;
+
+  std::vector<uint8_t> adapt_ues_array_;
+  std::vector<std::vector<size_t>> sched_map_array_;
+  size_t max_ue_sched_num_;
 
   // First dimension: symbol_num_perframe * BS_ANT_NUM
   // Second dimension: (CP_LEN + OFDM_CA_NUM) * 2

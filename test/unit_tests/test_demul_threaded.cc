@@ -4,6 +4,7 @@
 
 #include "concurrentqueue.h"
 #include "config.h"
+#include "data_generator.h"
 #include "dodemul.h"
 #include "gettime.h"
 #include "modulation.h"
@@ -14,14 +15,15 @@ static constexpr size_t kNumWorkers = 14;
 static constexpr size_t kMaxTestNum = 100;
 static constexpr size_t kMaxItrNum = (1 << 30);
 static constexpr size_t kModTestNum = 3;
-static constexpr size_t kModBitsNums[kModTestNum] = {4, 6, 4};
-static constexpr double kCodeRate[kModTestNum] = {0.333, 0.333, 0.666};
+static constexpr size_t kModBitsNums[kModTestNum] = {4, 6, 2};
+static constexpr size_t kMCSIndices[kModTestNum] = {10, 17, 5};
 static constexpr size_t kFrameOffsets[kModTestNum] = {0, 20, 30};
 // A spinning barrier to synchronize the start of worker threads
 static std::atomic<size_t> num_workers_ready_atomic;
 
 void MasterToWorkerDynamicMaster(
-    Config* cfg, moodycamel::ConcurrentQueue<EventData>& event_queue,
+    Config* cfg, MacScheduler* mac,
+    moodycamel::ConcurrentQueue<EventData>& event_queue,
     moodycamel::ConcurrentQueue<EventData>& complete_task_queue) {
   PinToCoreWithOffset(ThreadType::kMaster, cfg->CoreOffset(), 0);
   // Wait for all worker threads to be ready
@@ -30,10 +32,9 @@ void MasterToWorkerDynamicMaster(
   }
 
   for (size_t bs_ant_idx = 0; bs_ant_idx < kModTestNum; bs_ant_idx++) {
-    nlohmann::json msc_params = cfg->MCSParams(Direction::kUplink);
-    msc_params["modulation"] = MapModToStr(kModBitsNums[bs_ant_idx]);
-    msc_params["code_rate"] = kCodeRate[bs_ant_idx];
-    cfg->UpdateUlMCS(msc_params);
+    nlohmann::json ul_mcs_params = mac->Params().GetMcsJson(Direction::kUplink);
+    ul_mcs_params["mcs_index"] = kMCSIndices[bs_ant_idx];
+    mac->Params().UpdateUlMcsParams(ul_mcs_params);
     for (size_t i = 0; i < kMaxTestNum; i++) {
       uint32_t frame_id =
           i / (cfg->DemulEventsPerSymbol() * cfg->Frame().NumULSyms()) +
@@ -70,7 +71,7 @@ void MasterToWorkerDynamicWorker(
     Table<complex_float>& ue_spec_pilot_buffer,
     Table<complex_float>& equal_buffer,
     PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& demod_buffers_,
-    PhyStats* phy_stats, Stats* stats) {
+    MacScheduler* mac_sched, PhyStats* phy_stats, Stats* stats) {
   PinToCoreWithOffset(ThreadType::kWorker, cfg->CoreOffset() + 1, worker_id);
 
   // Wait for all threads (including master) to start runnung
@@ -81,7 +82,7 @@ void MasterToWorkerDynamicWorker(
 
   auto compute_demul = std::make_unique<DoDemul>(
       cfg, worker_id, data_buffer, ul_beam_matrices, ue_spec_pilot_buffer,
-      equal_buffer, demod_buffers_, phy_stats, stats);
+      equal_buffer, demod_buffers_, mac_sched, phy_stats, stats);
 
   size_t start_tsc = GetTime::Rdtsc();
   size_t num_tasks = 0;
@@ -100,7 +101,7 @@ void MasterToWorkerDynamicWorker(
                  cur_frame_id - kFrameOffsets[2] <= max_frame_id_wo_offset) {
         frame_offset_id = 2;
       }
-      ASSERT_EQ(cfg->ModOrderBits(Direction::kUplink),
+      ASSERT_EQ(mac_sched->Params().ModOrderBits(Direction::kUplink),
                 kModBitsNums[frame_offset_id]);
       EventData resp_event = compute_demul->Launch(req_event.tags_[0]);
       TryEnqueueFallback(&complete_task_queue, ptok, resp_event);
@@ -117,7 +118,8 @@ void MasterToWorkerDynamicWorker(
 TEST(TestDemul, VaryingConfig) {
   static constexpr size_t kNumIters = 10000;
   auto cfg = std::make_unique<Config>("files/config/ci/tddconfig-sim-ul.json");
-  cfg->GenData();
+  DataGenerator::GenerateUlTxTestVectors(cfg.get());
+  cfg->LoadTestVectors();
 
   auto event_queue = moodycamel::ConcurrentQueue<EventData>(2 * kNumIters);
   moodycamel::ProducerToken* ptoks[kNumWorkers];
@@ -142,7 +144,7 @@ TEST(TestDemul, VaryingConfig) {
                               cfg->Frame().ClientUlPilotSymbols() * kMaxUEs,
                               Agora_memory::Alignment_t::kAlign64);
   PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t> demod_buffers(
-      kFrameWnd, cfg->Frame().NumTotalSyms(), cfg->UeAntNum(),
+      kFrameWnd, cfg->Frame().NumUlDataSyms(), cfg->UeAntNum(),
       kMaxModType * cfg->OfdmDataNum());
   std::printf(
       "Size of [data_buffer, ul_beam_matrices, equal_buffer, "
@@ -158,19 +160,21 @@ TEST(TestDemul, VaryingConfig) {
       cfg->Frame().NumULSyms() * kFrameWnd * kMaxModType * kMaxDataSCs *
           kMaxUEs * 1.0f / 1024 / 1024);
 
+  auto mac_sched = std::make_unique<MacScheduler>(cfg.get());
   auto stats = std::make_unique<Stats>(cfg.get());
-  auto phy_stats = std::make_unique<PhyStats>(cfg.get(), Direction::kUplink);
+  auto phy_stats = std::make_unique<PhyStats>(cfg.get(), mac_sched.get(),
+                                              Direction::kUplink);
 
   std::vector<std::thread> threads;
-  threads.emplace_back(MasterToWorkerDynamicMaster, cfg.get(),
+  threads.emplace_back(MasterToWorkerDynamicMaster, cfg.get(), mac_sched.get(),
                        std::ref(event_queue), std::ref(complete_task_queue));
   for (size_t i = 0; i < kNumWorkers; i++) {
-    threads.emplace_back(MasterToWorkerDynamicWorker, cfg.get(), i,
-                         std::ref(event_queue), std::ref(complete_task_queue),
-                         ptoks[i], std::ref(data_buffer),
-                         std::ref(ul_beam_matrices), std::ref(equal_buffer),
-                         std::ref(ue_spec_pilot_buffer),
-                         std::ref(demod_buffers), phy_stats.get(), stats.get());
+    threads.emplace_back(
+        MasterToWorkerDynamicWorker, cfg.get(), i, std::ref(event_queue),
+        std::ref(complete_task_queue), ptoks[i], std::ref(data_buffer),
+        std::ref(ul_beam_matrices), std::ref(equal_buffer),
+        std::ref(ue_spec_pilot_buffer), std::ref(demod_buffers),
+        mac_sched.get(), phy_stats.get(), stats.get());
   }
 
   for (auto& thread : threads) {

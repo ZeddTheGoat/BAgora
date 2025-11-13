@@ -10,6 +10,7 @@
 #include "concurrentqueue.h"
 #include "config.h"
 #include "doer.h"
+#include "mac_scheduler.h"
 #include "memory_manage.h"
 #include "mkl_dfti.h"
 #include "phy_stats.h"
@@ -23,7 +24,8 @@ class DoDemul : public Doer {
           Table<complex_float>& ue_spec_pilot_buffer,
           Table<complex_float>& equal_buffer,
           PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& demod_buffers_,
-          PhyStats* in_phy_stats, Stats* in_stats_manager);
+          MacScheduler* mac_sched, PhyStats* in_phy_stats,
+          Stats* in_stats_manager);
   ~DoDemul() override;
 
   /**
@@ -60,6 +62,7 @@ class DoDemul : public Doer {
   Table<complex_float>& ue_spec_pilot_buffer_;
   Table<complex_float>& equal_buffer_;
   PtrCube<kFrameWnd, kMaxSymbols, kMaxUEs, int8_t>& demod_buffers_;
+  MacScheduler* mac_sched_;
   DurationStat* duration_stat_;
   PhyStats* phy_stats_;
 
@@ -72,11 +75,6 @@ class DoDemul : public Doer {
   complex_float* equaled_buffer_temp_transposed_;
   arma::cx_fmat ue_pilot_data_;
   int ue_num_simd256_;
-
-#if defined(USE_MKL_JIT)
-  void* jitter_;
-  cgemm_jit_kernel_t mkl_jit_cgemm_;
-#endif
 };
 
 #endif  // DODEMUL_H_

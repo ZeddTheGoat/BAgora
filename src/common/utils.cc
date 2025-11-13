@@ -119,7 +119,6 @@ void SetCpuLayoutOnNumaNodes(bool verbose,
       }
     }
     std::printf("Usable Cpu count %zu\n", cpu_layout.size());
-
     numa_bitmask_free(bm);
     cpu_layout_initialized = true;
   }
@@ -202,6 +201,23 @@ void PinToCoreWithOffset(ThreadType thread_type, size_t core_offset,
       }
     }  // EnableThreadPinning == true
   }
+}
+
+void RemoveCoreFromList(int core_id, int core_offset) {
+  if (core_list.back().requested_core_ == (size_t)(core_id + core_offset)) {
+    core_list.pop_back();
+  }
+}
+
+size_t GetAvailableCores() {
+  std::ifstream file("/sys/fs/cgroup/cpuset/cpuset.cpus");
+  std::string s;
+  std::getline(file, s);
+
+  size_t start_core = (size_t)stoi(s.substr(0, s.find('-')));
+  size_t end_core = (size_t)stoi(s.substr(s.find('-') + 1));
+  // remove master core, tx/rx core
+  return end_core - start_core;
 }
 
 std::vector<size_t> Utils::StrToChannels(const std::string& channel) {
@@ -302,6 +318,52 @@ std::vector<uint32_t> Utils::Cfloat32ToUint32(
     } else if (order == "QI") {
       out.at(i) = (uint32_t)im << 16 | re;
     }
+  }
+  return out;
+}
+
+size_t Utils::Bits2Int(std::vector<uint8_t> in) {
+  size_t out = 0;
+  for (size_t i = 0; i < in.size(); i++) {
+    out += static_cast<size_t>(in.at(i) * std::pow(2, i));
+  }
+  return out;
+}
+
+size_t Utils::Bits2Int(arma::uvec in) {
+  size_t out = 0;
+  for (size_t i = 0; i < in.n_elem; i++) {
+    out += static_cast<size_t>(in(i)*std::pow(2, i));
+  }
+  return out;
+}
+
+size_t Utils::BitIndices2Int(arma::uvec in) {
+  size_t out = 0;
+  for (size_t i = 0; i < in.n_elem; i++) {
+    out += static_cast<size_t>(std::pow(2, in(i)));
+  }
+  return out;
+}
+
+arma::cx_frowvec Utils::Int2Bits(size_t in, size_t num_bits) {
+  arma::cx_frowvec out(num_bits, arma::fill::zeros);
+  for (size_t i = 0; i < num_bits; i++) {
+    if ((in & 1) != 0u) {
+      out(i) = arma::cx_float(1, 0);
+    }
+    in >>= 1;
+  }
+  return out;
+}
+
+arma::uvec Utils::BitOneIndices(size_t in, size_t num_bits) {
+  arma::uvec out;
+  for (size_t i = 0; i < num_bits; i++) {
+    if ((in & 1) != 0u) {
+      out = arma::join_cols(out, arma::uvec({i}));
+    }
+    in >>= 1;
   }
   return out;
 }
@@ -407,8 +469,8 @@ void Utils::PrintVector(const std::vector<std::complex<int16_t>>& data) {
 }
 
 void Utils::WriteBinaryFile(const std::string& name, size_t elem_size,
-                            size_t buffer_size, void* buff) {
-  auto* f_handle = std::fopen(name.c_str(), "wb");
+                            size_t buffer_size, void* buff, bool append) {
+  auto* f_handle = std::fopen(name.c_str(), append ? "ab" : "wb");
   if (f_handle == nullptr) {
     throw std::runtime_error("Failed to open binary file " + name);
   }
@@ -417,6 +479,29 @@ void Utils::WriteBinaryFile(const std::string& name, size_t elem_size,
   if (write_status != buffer_size) {
     throw std::runtime_error("Failed to write binary file " + name);
   }
+  const auto close_status = std::fclose(f_handle);
+  if (close_status != 0) {
+    throw std::runtime_error("Failed to close binary file " + name);
+  }
+}
+
+void Utils::ReadBinaryFile(const std::string& name, size_t elem_size,
+                           size_t buffer_size, size_t offset, void* buff) {
+  auto* f_handle = std::fopen(name.c_str(), "rb");
+  if (f_handle == nullptr) {
+    throw std::runtime_error("Failed to open binary file " + name);
+  }
+  const auto seek_status = std::fseek(f_handle, offset, SEEK_CUR);
+  if (seek_status != 0) {
+    throw std::runtime_error("Failed to seek properly into binary file " +
+                             name);
+  }
+
+  const auto read_status = std::fread(buff, elem_size, buffer_size, f_handle);
+  if (read_status != buffer_size) {
+    throw std::runtime_error("Failed to read binary file " + name);
+  }
+
   const auto close_status = std::fclose(f_handle);
   if (close_status != 0) {
     throw std::runtime_error("Failed to close binary file " + name);
@@ -495,21 +580,25 @@ void Utils::PrintVec(const arma::cx_fvec& c, const std::string& ss) {
   std::cout << so.str();
 }
 
-void Utils::WriteVector(const std::string filename, const std::string desc,
-                        const std::vector<int> vec_data) {
+void Utils::WriteVector(const std::string& filename, const std::string& desc,
+                        const std::vector<int>& vec_data) {
   std::stringstream so;
   std::ofstream of;
   of.open(filename);
-  if (desc.size() > 0) so << desc << std::endl;
+  if (!desc.empty()) {
+    so << desc << std::endl;
+  }
   for (size_t j = 0; j < vec_data.size(); j++) {
     so << vec_data.at(j);
-    if (j < vec_data.size() - 1) so << std::endl;
+    if (j < vec_data.size() - 1) {
+      so << std::endl;
+    }
   }
   of << so.str();
   of.close();
 }
 
-std::vector<int> Utils::ReadVector(const std::string filename,
+std::vector<int> Utils::ReadVector(const std::string& filename,
                                    const bool skip_line) {
   std::string line;
   bool first_line = skip_line;
@@ -529,41 +618,45 @@ std::vector<int> Utils::ReadVector(const std::string filename,
 }
 
 void Utils::WriteVectorOfComplex(
-    const std::string filename, const std::string desc,
-    const std::array<std::vector<std::complex<double>>, kMaxChannels>
+    const std::string& filename, const std::string& desc,
+    const std::array<std::vector<std::complex<double>>, kMaxChannels>&
         vec_data) {
   size_t num_lines = 0;
   for (size_t i = 0; i < kMaxChannels; i++) {
-    if (num_lines != 0 && vec_data.at(i).size() != 0 &&
+    if (num_lines != 0 && !vec_data.at(i).empty() &&
         vec_data.at(i).size() != num_lines) {
       std::cerr
           << "Bad input data format! Inconsistent vector size among channels."
           << std::endl;
-    } else if (vec_data.at(i).size() > 0) {
+    } else if (!vec_data.at(i).empty()) {
       num_lines = vec_data.at(i).size();
     }
   }
   std::stringstream so;
   std::ofstream of;
   of.open(filename);
-  if (desc.size() > 0) so << desc << std::endl;
+  if (!desc.empty()) {
+    so << desc << std::endl;
+  }
   for (size_t j = 0; j < num_lines; j++) {
     for (size_t i = 0; i < kMaxChannels; i++) {
       // if channel data is populated
-      if (vec_data.at(i).size() > 0) {
+      if (!vec_data.at(i).empty()) {
         so << vec_data.at(i).at(j).real() << "+" << vec_data.at(i).at(j).imag()
            << ",";
       }
     }
-    if (j < num_lines - 1) so << std::endl;
+    if (j < num_lines - 1) {
+      so << std::endl;
+    }
   }
   of << so.str();
   of.close();
 }
 
 std::array<std::vector<std::complex<double>>, kMaxChannels>
-Utils::ReadVectorOfComplex(const std::string filename, const bool skip_line,
-                           const std::vector<size_t> present_channels) {
+Utils::ReadVectorOfComplex(const std::string& filename, const bool skip_line,
+                           const std::vector<size_t>& present_channels) {
   std::string cur_line;
   bool first_line = skip_line;
   std::ifstream myfile(filename, std::ifstream::in);
