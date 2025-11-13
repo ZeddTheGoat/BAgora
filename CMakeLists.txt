@@ -448,6 +448,15 @@ set(COMMON_SOURCES
   src/mac/schedulers/custom_schedule.cc
   src/mac/schedulers/round_robbin.cc
   src/mac/schedulers/proportional_fairness.cc
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc
+  src/agora/radio/radio.cc
+  src/agora/radio/radio_soapysdr.cc
+  src/agora/radio/radio_data_plane.cc
+  src/agora/radio/radio_socket.cc
+  src/agora/radio/radio_data_plane_soapy.cc
+  src/agora/radio/radio_data_plane_socket.cc
+  src/agora/radio/radio_set/radio_set.cc
   src/common/ipc/udp_comm.cc
   src/common/ipc/network_utils.cc
   src/common/loggers/csv_logger.cc
@@ -457,6 +466,10 @@ set(COMMON_SOURCES
   src/encoder/iobuffer.cc
   src/data_generator/data_generator.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
+
+list(APPEND COMMON_SOURCES
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc)
 
 set(SHARED_TXRX_SOURCES
   src/agora/txrx/packet_txrx.cc
