@@ -422,7 +422,7 @@ set(MAC_BS_SOURCES
   src/mac/file_receiver.cc
   src/mac/mac_basestation.cc)
 
-include_directories(
+include_directories(BEFORE
   src/common/
   src/common/ipc
   src/common/loggers
