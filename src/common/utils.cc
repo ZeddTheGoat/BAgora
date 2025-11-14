@@ -8,7 +8,9 @@
 
 #include "utils.h"
 
+#ifdef ENABLE_NUMA
 #include <numa.h>
+#endif
 
 #include <cassert>
 #include <iomanip>   // std::setw
@@ -60,7 +62,11 @@ static size_t GetCoreId(size_t core) {
 
 /* Print out summary of core-thread relationship */
 static void PrintCoreList(const std::list<CoreInfo>& clist) {
+#ifdef ENABLE_NUMA
   int numa_max_cpus = numa_num_configured_cpus();
+#else
+  int numa_max_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
   int system_cpus = sysconf(_SC_NPROCESSORS_ONLN);
   std::printf("=================================\n");
   std::printf("          CORE LIST SUMMARY      \n");
@@ -76,17 +82,20 @@ static void PrintCoreList(const std::list<CoreInfo>& clist) {
   std::printf("=================================\n");
 }
 
+#ifdef ENABLE_NUMA
 static void PrintBitmask(const struct bitmask* bm) {
   for (size_t i = 0; i < bm->size; ++i) {
     std::printf("%d", numa_bitmask_isbitset(bm, i));
   }
 }
+#endif
 
 void PrintCoreAssignmentSummary() { PrintCoreList(core_list); }
 
 void SetCpuLayoutOnNumaNodes(bool verbose,
                              const std::vector<size_t>& cores_to_exclude) {
   if (cpu_layout_initialized == false) {
+#ifdef ENABLE_NUMA
     int lib_accessable = numa_available();
     if (lib_accessable == -1) {
       throw std::runtime_error("libnuma not accessable");
@@ -121,6 +130,20 @@ void SetCpuLayoutOnNumaNodes(bool verbose,
     std::printf("Usable Cpu count %zu\n", cpu_layout.size());
 
     numa_bitmask_free(bm);
+#else
+    int numa_max_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    std::printf("System CPU count %d\n", numa_max_cpus);
+    for (int i = 0; i < numa_max_cpus; i++) {
+      if (std::find(cores_to_exclude.begin(), cores_to_exclude.end(),
+                    static_cast<size_t>(i)) == cores_to_exclude.end()) {
+        cpu_layout.emplace_back(static_cast<size_t>(i));
+      }
+    }
+    if (verbose) {
+      std::printf("NUMA disabled - using linear core layout\n");
+    }
+    std::printf("Usable Cpu count %zu\n", cpu_layout.size());
+#endif
     cpu_layout_initialized = true;
   }
 }

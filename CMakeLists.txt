@@ -134,8 +134,26 @@ else()
 endif()
 
 #External Libraries / Depends
-find_library(NUMA_LIBRARIES numa REQUIRED)
-message(VERBOSE "  Numa: Libraries ${NUMA_LIBRARIES}")
+option(ENABLE_NUMA "Enable libnuma-based CPU topology discovery" ON)
+if(ENABLE_NUMA)
+  find_path(NUMA_INCLUDE_DIR numa.h)
+  find_library(NUMA_LIBRARIES numa)
+  if(NUMA_INCLUDE_DIR AND NUMA_LIBRARIES)
+    message(STATUS "NUMA support enabled")
+    include_directories(${NUMA_INCLUDE_DIR})
+    add_definitions(-DENABLE_NUMA)
+    message(VERBOSE "  Numa: Includes ${NUMA_INCLUDE_DIR} Libraries ${NUMA_LIBRARIES}")
+  else()
+    message(WARNING "libnuma headers or libraries not found - disabling NUMA support")
+    set(ENABLE_NUMA OFF)
+  endif()
+endif()
+
+if(NOT ENABLE_NUMA)
+  set(NUMA_LIBRARIES "")
+  set(NUMA_INCLUDE_DIR "")
+  message(STATUS "NUMA support disabled")
+endif()
 
 # Intel MKL (threaded Intel10_64lp: Non-threaded Intel10_64lp_seq)
 set(BLA_VENDOR Intel10_64lp_seq)
@@ -304,6 +322,20 @@ set(GTEST_LIBRARIES ${GTEST_LIBRARIES} -lpthread)
 #third party libs included in our repo
 include_directories(third_party third_party/spdlog/include third_party/nlohmann/single_include)
 
+# Detect where the radio sources live (upstream Agora recently moved them)
+set(RADIO_SOURCE_DIR "src/agora/radio")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SOURCE_DIR}")
+  set(RADIO_SOURCE_DIR "src/radio")
+endif()
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SOURCE_DIR}/radio.cc")
+  message(FATAL_ERROR "Unable to locate radio sources under ${RADIO_SOURCE_DIR}; "
+                     "expected radio.cc to exist in either src/agora/radio or src/radio")
+endif()
+set(RADIO_SET_SOURCE_DIR "${RADIO_SOURCE_DIR}/radio_set")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set.cc")
+  message(FATAL_ERROR "Unable to locate radio_set sources under ${RADIO_SET_SOURCE_DIR}")
+endif()
+
 add_definitions(-DTHREADED_INIT)
 
 if(RADIO_TYPE STREQUAL PURE_UHD)
@@ -334,8 +366,8 @@ if(RADIO_TYPE STREQUAL PURE_UHD)
   message(STATUS "Using Boost Version: ${Boost_VERSION}")
 
   set(PUREUHD_SOURCES
-      src/agora/radio/radio_set/radio_set_uhd.cc
-      src/agora/radio/radio_uhdsdr.cc
+      ${RADIO_SET_SOURCE_DIR}/radio_set_uhd.cc
+      ${RADIO_SOURCE_DIR}/radio_uhdsdr.cc
       )
   set(PUREUHD_SOURCES_AGORA
       src/agora/txrx/workers/txrx_worker_usrp.cc
@@ -373,8 +405,8 @@ include_directories(
   src/recorder
   src/mac/
   src/agora/
-  src/agora/radio
-  src/agora/radio/radio_set
+  ${RADIO_SOURCE_DIR}
+  ${RADIO_SET_SOURCE_DIR}
   src/agora/txrx
   src/agora/txrx/workers
   src/client
@@ -412,20 +444,22 @@ set(COMMON_SOURCES
   src/common/crc.cc
   src/common/memory_manage.cc
   src/common/scrambler.cc
-  src/agora/radio/radio.cc
-  src/agora/radio/radio_soapysdr.cc
-  src/agora/radio/radio_data_plane.cc
-  src/agora/radio/radio_socket.cc
-  src/agora/radio/radio_data_plane_soapy.cc
-  src/agora/radio/radio_data_plane_socket.cc
-  src/agora/radio/radio_set/radio_set.cc
+  ${RADIO_SOURCE_DIR}/radio.cc
+  ${RADIO_SOURCE_DIR}/radio_soapysdr.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane.cc
+  ${RADIO_SOURCE_DIR}/radio_socket.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane_soapy.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane_socket.cc
+  ${RADIO_SET_SOURCE_DIR}/radio_set.cc
   src/common/ipc/udp_comm.cc
   src/common/ipc/network_utils.cc
   src/common/loggers/csv_logger.cc
   src/common/loggers/mat_logger.cc
   src/encoder/cyclic_shift.cc
   src/encoder/encoder.cc
-  src/encoder/iobuffer.cc)
+  src/encoder/iobuffer.cc
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
 
 set(SHARED_TXRX_SOURCES
@@ -452,7 +486,7 @@ set(AGORA_SOURCES ${AGORA_SOURCES}
   src/agora/dodemul.cc
   src/agora/doprecode.cc
   src/agora/dodecode.cc
-  src/agora/radio/radio_set/radio_set_bs.cc
+  ${RADIO_SET_SOURCE_DIR}/radio_set_bs.cc
   src/mac/mac_thread_basestation.cc
   src/agora/txrx/packet_txrx_sim.cc
   src/agora/txrx/packet_txrx_radio.cc
@@ -491,10 +525,10 @@ add_executable(agora
 target_link_libraries(agora ${COMMON_LIBS})
 
 add_executable(calibrate
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/agora/radio/radio_set/calibrate_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/agora/radio/radio_set/radio_set_calibrate.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/agora/radio/radio_set/radio_calibrate_digital.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/agora/radio/radio_set/radio_calibrate_analog.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/calibrate_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set_calibrate.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_digital.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_analog.cc
   $<TARGET_OBJECTS:common_sources_lib>)
 target_link_libraries(calibrate ${COMMON_LIBS})
 target_compile_definitions(calibrate PRIVATE CALIBRATE)
