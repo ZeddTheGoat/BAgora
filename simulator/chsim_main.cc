@@ -6,6 +6,7 @@
 
 #include "channel_sim.h"
 #include "logger.h"
+#include "signal_handler.h"
 #include "version_config.h"
 
 DEFINE_uint64(bs_threads, 1,
@@ -22,7 +23,7 @@ DEFINE_string(
     TOSTRING(PROJECT_DIRECTORY) "/files/config/ci/tddconfig-sim-both.json",
     "Config filename");
 DEFINE_string(chan_model, "RAYLEIGH", "Simulator Channel Type: RAYLEIGH/AWGN");
-DEFINE_double(chan_snr, 20.0, "Signal-to-Noise Ratio");
+DEFINE_string(chan_dataset, "", "Dataset source");
 
 int main(int argc, char* argv[]) {
   int ret = EXIT_FAILURE;
@@ -40,7 +41,7 @@ int main(int argc, char* argv[]) {
       auto sim = std::make_unique<ChannelSim>(
           config.get(), FLAGS_bs_threads, FLAGS_ue_threads,
           FLAGS_worker_threads, FLAGS_core_offset, FLAGS_chan_model,
-          FLAGS_chan_snr);
+          FLAGS_chan_dataset);
       sim->Run();
       ret = EXIT_SUCCESS;
     } catch (SignalException& e) {

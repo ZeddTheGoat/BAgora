@@ -33,6 +33,7 @@ DoIFFT::DoIFFT(Config* in_config, int in_tid,
   ifft_out_ = static_cast<float*>(
       Agora_memory::PaddedAlignedAlloc(Agora_memory::Alignment_t::kAlign64,
                                        2 * cfg_->OfdmCaNum() * sizeof(float)));
+
   ifft_shift_tmp_ = static_cast<complex_float*>(
       Agora_memory::PaddedAlignedAlloc(Agora_memory::Alignment_t::kAlign64,
                                        2 * cfg_->OfdmCaNum() * sizeof(float)));
@@ -51,43 +52,52 @@ EventData DoIFFT::Launch(size_t tag) {
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ant_id_;
-
-  const size_t symbol_idx_dl = cfg_->Frame().GetDLSymbolIdx(symbol_id);
+  const bool bypass_ifft = cfg_->FreqDomainChannel();
 
   if (kDebugPrintInTask) {
     std::printf("In doIFFT thread %d: frame: %zu, symbol: %zu, antenna: %zu\n",
                 tid_, frame_id, symbol_id, ant_id);
   }
 
-  const size_t offset =
-      (cfg_->GetTotalDataSymbolIdxDl(frame_id, symbol_idx_dl) *
-       cfg_->BsAntNum()) +
-      ant_id;
+  const size_t dl_symbol_idx = cfg_->Frame().GetDLSymbolIdx(symbol_id);
+  const size_t total_symbol_idx_dl =
+      cfg_->GetTotalSymbolIdxDl(frame_id, dl_symbol_idx);
+  const size_t in_offset = (total_symbol_idx_dl * cfg_->BsAntNum()) + ant_id;
+
+  const size_t total_symbol_idx =
+      cfg_->GetTotalSymbolIdxDlBcast(frame_id, symbol_id);
+  const size_t out_offset = (total_symbol_idx * cfg_->BsAntNum()) + ant_id;
 
   const size_t start_tsc1 = GetTime::WorkerRdtsc();
   duration_stat_->task_duration_[1u] += start_tsc1 - start_tsc;
 
-  auto* ifft_in_ptr = reinterpret_cast<float*>(dl_ifft_buffer_[offset]);
+  auto* ifft_in_ptr = reinterpret_cast<float*>(dl_ifft_buffer_[in_offset]);
   auto* ifft_out_ptr =
       (kUseOutOfPlaceIFFT || kMemcpyBeforeIFFT) ? ifft_out_ : ifft_in_ptr;
 
   std::memset(ifft_in_ptr, 0, sizeof(float) * cfg_->OfdmDataStart() * 2);
   std::memset(ifft_in_ptr + (cfg_->OfdmDataStop()) * 2, 0,
               sizeof(float) * cfg_->OfdmDataStart() * 2);
-  CommsLib::FFTShift(reinterpret_cast<complex_float*>(ifft_in_ptr),
-                     ifft_shift_tmp_, cfg_->OfdmCaNum());
-  if (kMemcpyBeforeIFFT) {
+
+  if (bypass_ifft && kMemcpyBeforeIFFT) {
     std::memcpy(ifft_out_ptr, ifft_in_ptr,
                 sizeof(float) * cfg_->OfdmCaNum() * 2);
-    DftiComputeBackward(mkl_handle_, ifft_out_ptr);
   } else {
-    if (kUseOutOfPlaceIFFT) {
-      // Use out-of-place IFFT here is faster than in place IFFT
-      // There is no need to reset non-data subcarriers in ifft input
-      // to 0 since their values are not changed after IFFT
-      DftiComputeBackward(mkl_handle_, ifft_in_ptr, ifft_out_ptr);
+    CommsLib::FFTShift(reinterpret_cast<complex_float*>(ifft_in_ptr),
+                       ifft_shift_tmp_, cfg_->OfdmCaNum());
+    if (kMemcpyBeforeIFFT) {
+      std::memcpy(ifft_out_ptr, ifft_in_ptr,
+                  sizeof(float) * cfg_->OfdmCaNum() * 2);
+      DftiComputeBackward(mkl_handle_, ifft_out_ptr);
     } else {
-      DftiComputeBackward(mkl_handle_, ifft_in_ptr);
+      if (kUseOutOfPlaceIFFT) {
+        // Use out-of-place IFFT here is faster than in place IFFT
+        // There is no need to reset non-data subcarriers in ifft input
+        // to 0 since their values are not changed after IFFT
+        DftiComputeBackward(mkl_handle_, ifft_in_ptr, ifft_out_ptr);
+      } else {
+        DftiComputeBackward(mkl_handle_, ifft_in_ptr);
+      }
     }
   }
 
@@ -104,12 +114,16 @@ EventData DoIFFT::Launch(size_t tag) {
     }
   }
   if (clipping) {
-    AGORA_LOG_WARN("Clipping occured in Frame %zu, Symbol %zu, Antenna %zu\n",
-                   frame_id, symbol_id, ant_id);
+    AGORA_LOG_WARN(
+        "Clipping occured in Frame %zu, Symbol %zu, Antenna "
+        "%zu\n",
+        frame_id, symbol_id, ant_id);
   }
   if (ant_id < cfg_->BfAntNum() && max_abs < 1e-4) {
-    AGORA_LOG_WARN("Possibly bad antenna %zu with max sample value %2.2f\n",
-                   ant_id, max_abs);
+    AGORA_LOG_WARN(
+        "Possibly bad antenna %zu with max sample value "
+        "%2.2f\n",
+        ant_id, max_abs);
   }
   if (kPrintIfftStats) {
     std::printf("%2.3f\n", max_abs);
@@ -120,8 +134,8 @@ EventData DoIFFT::Launch(size_t tag) {
     ss << "IFFT_output" << ant_id << "=[";
     for (size_t i = 0; i < cfg_->OfdmCaNum(); i++) {
       ss << std::fixed << std::setw(5) << std::setprecision(3)
-         << dl_ifft_buffer_[offset][i].re << "+1j*"
-         << dl_ifft_buffer_[offset][i].im << " ";
+         << dl_ifft_buffer_[in_offset][i].re << "+1j*"
+         << dl_ifft_buffer_[in_offset][i].im << " ";
     }
     ss << "];" << std::endl;
     std::cout << ss.str();
@@ -131,7 +145,7 @@ EventData DoIFFT::Launch(size_t tag) {
   duration_stat_->task_duration_[2u] += start_tsc2 - start_tsc1;
 
   auto* pkt = reinterpret_cast<Packet*>(
-      &dl_socket_buffer_[offset * cfg_->DlPacketLength()]);
+      &dl_socket_buffer_[out_offset * cfg_->DlPacketLength()]);
   short* socket_ptr = &pkt->data_[2u * cfg_->OfdmTxZeroPrefix()];
 
   // IFFT scaled results by OfdmCaNum(), we scale down IFFT results
@@ -143,7 +157,7 @@ EventData DoIFFT::Launch(size_t tag) {
 
   if (kPrintSocketOutput) {
     std::stringstream ss;
-    ss << "socket_tx_data" << ant_id << "_" << symbol_idx_dl << "=[";
+    ss << "socket_tx_data" << ant_id << "_" << symbol_id << "=[";
     for (size_t i = 0; i < cfg_->SampsPerSymbol(); i++) {
       ss << socket_ptr[i * 2] << "+1j*" << socket_ptr[i * 2 + 1] << " ";
     }
@@ -153,5 +167,5 @@ EventData DoIFFT::Launch(size_t tag) {
 
   duration_stat_->task_count_++;
   duration_stat_->task_duration_[0u] += GetTime::WorkerRdtsc() - start_tsc;
-  return EventData(EventType::kIFFT, tag);
+  return {EventType::kIFFT, tag};
 }

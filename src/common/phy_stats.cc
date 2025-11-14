@@ -9,8 +9,10 @@
 
 #include "logger.h"
 
-PhyStats::PhyStats(Config* const cfg, Direction dir)
+PhyStats::PhyStats(Config* const cfg, MacScheduler* const mac_sched,
+                   Direction dir)
     : config_(cfg),
+      mac_sched_(mac_sched),
       dir_(dir),
       logger_plt_snr_(CsvLog::kPltSnr, cfg, dir, true),
       logger_plt_rssi_(CsvLog::kPltRssi, cfg, dir, true),
@@ -36,7 +38,7 @@ PhyStats::PhyStats(Config* const cfg, Direction dir)
     num_rx_symbols_ = cfg->Frame().NumULSyms();
     num_rxdata_symbols_ = cfg->Frame().NumUlDataSyms();
   }
-  const size_t task_buffer_symbol_num = num_rx_symbols_ * kFrameWnd;
+  const size_t task_buffer_symbol_num = num_rxdata_symbols_ * kFrameWnd;
 
   decoded_bits_count_.Calloc(cfg->UeAntNum(), task_buffer_symbol_num,
                              Agora_memory::Alignment_t::kAlign64);
@@ -66,19 +68,6 @@ PhyStats::PhyStats(Config* const cfg, Direction dir)
   evm_sc_buffer_.Calloc(kFrameWnd, cfg->UeAntNum() * cfg->OfdmDataNum(),
                         Agora_memory::Alignment_t::kAlign64);
 
-  if (num_rxdata_symbols_ > 0) {
-    gt_cube_ = arma::cx_fcube(cfg->UeAntNum(), cfg->OfdmDataNum(),
-                              num_rxdata_symbols_);
-    for (size_t i = 0; i < num_rxdata_symbols_; i++) {
-      auto* iq_f_ptr = reinterpret_cast<arma::cx_float*>(
-          (dir_ == Direction::kDownlink)
-              ? cfg->DlIqF()[cfg->Frame().ClientDlPilotSymbols() + i]
-              : cfg->UlIqF()[cfg->Frame().ClientUlPilotSymbols() + i]);
-      arma::cx_fmat iq_f_mat(iq_f_ptr, cfg->OfdmDataNum(), cfg->UeAntNum(),
-                             false);
-      gt_cube_.slice(i) = iq_f_mat.st();
-    }
-  }
   dl_pilot_snr_.Calloc(kFrameWnd,
                        cfg->UeAntNum() * cfg->Frame().ClientDlPilotSymbols(),
                        Agora_memory::Alignment_t::kAlign64);
@@ -129,8 +118,28 @@ PhyStats::~PhyStats() {
   dl_pilot_noise_.Free();
 }
 
+void PhyStats::LoadGroundTruthIq() {
+  if (num_rxdata_symbols_ > 0) {
+    size_t n_frames = 1;
+    if (config_->AdaptUes()) {
+      n_frames = mac_sched_->NumGroups();
+    }
+    gt_cube_ =
+        arma::cx_fcube(this->config_->UeAntNum(), this->config_->OfdmDataNum(),
+                       n_frames * num_rxdata_symbols_);
+    for (size_t i = 0; i < num_rxdata_symbols_ * n_frames; i++) {
+      auto* iq_f_ptr = reinterpret_cast<arma::cx_float*>(
+          (dir_ == Direction::kDownlink) ? config_->DlIqF()[i]
+                                         : config_->UlIqF()[i]);
+      arma::cx_fmat iq_f_mat(iq_f_ptr, this->config_->OfdmDataNum(),
+                             this->config_->UeAntNum(), false);
+      gt_cube_.slice(i) = iq_f_mat.st();
+    }
+  }
+}
+
 void PhyStats::PrintPhyStats() {
-  const size_t task_buffer_symbol_num = num_rx_symbols_ * kFrameWnd;
+  const size_t task_buffer_symbol_num = num_rxdata_symbols_ * kFrameWnd;
   std::string tx_type;
   if (dir_ == Direction::kDownlink) {
     tx_type = "Downlink";
@@ -138,7 +147,7 @@ void PhyStats::PrintPhyStats() {
     tx_type = "Uplink";
   }
 
-  if (num_rx_symbols_ > 0) {
+  if (num_rxdata_symbols_ > 0) {
     for (size_t ue_id = 0; ue_id < this->config_->UeAntNum(); ue_id++) {
       size_t total_decoded_bits(0);
       size_t total_bit_errors(0);
@@ -165,17 +174,20 @@ void PhyStats::PrintPhyStats() {
   }
 }
 
-void PhyStats::PrintEvmStats(size_t frame_id) {
-  arma::fmat evm_buf(evm_buffer_[frame_id % kFrameWnd], config_->UeAntNum(), 1,
-                     false);
-  arma::fmat evm_mat =
-      evm_buf.st() / (config_->OfdmDataNum() * num_rxdata_symbols_);
+void PhyStats::PrintEvmStats(size_t frame_id, const arma::uvec& ue_list) {
+  //Disable the EVM if the mac is enabled
+  if constexpr (kEnableMac == false) {
+    arma::fmat evm_buf(evm_buffer_[frame_id % kFrameWnd], config_->UeAntNum(),
+                       1, false);
+    arma::fmat evm_mat =
+        evm_buf.st() / (config_->OfdmDataNum() * num_rxdata_symbols_);
 
-  [[maybe_unused]] std::stringstream ss;
-  ss << "Frame " << frame_id << " Constellation:\n"
-     << "  EVM " << (100.0f * evm_mat) << ", SNR "
-     << (-10.0f * arma::log10(evm_mat));
-  AGORA_LOG_INFO("%s\n", ss.str().c_str());
+    [[maybe_unused]] std::stringstream ss;
+    ss << "Frame " << frame_id << ", Scheduled User(s): \n  " << ue_list.st()
+       << "  EVM " << (100.0f * arma::sqrt(evm_mat(ue_list).st())) << "  SNR "
+       << (-10.0f * arma::log10(evm_mat(ue_list).st()));
+    AGORA_LOG_INFO("%s\n", ss.str().c_str());
+  }
 }
 
 float PhyStats::GetEvmSnr(size_t frame_id, size_t ue_id) {
@@ -190,12 +202,13 @@ void PhyStats::ClearEvmBuffer(size_t frame_id) {
   }
 }
 
-void PhyStats::PrintDlSnrStats(size_t frame_id) {
+void PhyStats::PrintDlSnrStats(size_t frame_id, const arma::uvec& ue_list) {
   [[maybe_unused]] std::stringstream ss;
   ss << "Frame " << frame_id << " DL Pilot SNR (dB) at " << std::fixed
      << std::setw(5) << std::setprecision(1);
   size_t dl_pilots_num = config_->Frame().ClientDlPilotSymbols();
-  for (size_t i = 0; i < config_->UeAntNum(); i++) {
+  for (const auto& i : ue_list) {
+    //for (size_t i = 0; i < config_->UeAntNum(); i++) {
     ss << "UE Antenna " << i << ": [ ";
     for (size_t j = 0; j < dl_pilots_num; j++) {
       float frame_snr =
@@ -328,7 +341,8 @@ void PhyStats::RecordCsiCond(size_t frame_id, size_t num_rec_sc) {
   }
 }
 
-void PhyStats::RecordEvm(size_t frame_id, size_t num_rec_sc) {
+void PhyStats::RecordEvm(size_t frame_id, size_t num_rec_sc,
+                         const arma::uvec& ue_map) {
   if (kEnableCsvLog) {
     std::stringstream ss_evm;
     std::stringstream ss_evm_sc;
@@ -336,9 +350,12 @@ void PhyStats::RecordEvm(size_t frame_id, size_t num_rec_sc) {
     ss_evm_sc << frame_id;
     const size_t num_frame_data = config_->OfdmDataNum() * num_rxdata_symbols_;
     for (size_t ue_id = 0; ue_id < config_->UeAntNum(); ue_id++) {
+      const float evm_pcnt =
+          ((std::sqrt(evm_buffer_[frame_id % kFrameWnd][ue_id] /
+                      num_frame_data)) *
+           100.0f);
       ss_evm << ","
-             << ((evm_buffer_[frame_id % kFrameWnd][ue_id] / num_frame_data) *
-                 100.0f);
+             << ((ue_map.at(ue_id) != 0) ? std::to_string(evm_pcnt) : "ns");
     }
     const size_t sc_step = config_->OfdmDataNum() / num_rec_sc;
     const size_t sc_offset = sc_step / 2;
@@ -346,9 +363,11 @@ void PhyStats::RecordEvm(size_t frame_id, size_t num_rec_sc) {
       for (size_t sc_rec = 0; sc_rec < num_rec_sc; sc_rec++) {
         const size_t sc_id = sc_rec * sc_step + sc_offset;
         const size_t ue_offset = ue_id * config_->OfdmDataNum();
-        ss_evm_sc << ","
-                  << (evm_sc_buffer_[frame_id % kFrameWnd][ue_offset + sc_id] *
-                      100.0f);
+        ss_evm_sc
+            << ","
+            << (std::sqrt(
+                    evm_sc_buffer_[frame_id % kFrameWnd][ue_offset + sc_id]) *
+                100.0f);
       }
     }
     logger_evm_.Write(ss_evm.str());
@@ -356,21 +375,22 @@ void PhyStats::RecordEvm(size_t frame_id, size_t num_rec_sc) {
   }
 }
 
-void PhyStats::RecordEvmSnr(size_t frame_id) {
+void PhyStats::RecordEvmSnr(size_t frame_id, const arma::uvec& ue_map) {
   if (kEnableCsvLog) {
     std::stringstream ss;
     ss << frame_id;
     const size_t num_frame_data = config_->OfdmDataNum() * num_rxdata_symbols_;
     for (size_t i = 0; i < config_->UeAntNum(); i++) {
-      ss << ","
-         << (-10.0f *
-             std::log10(evm_buffer_[frame_id % kFrameWnd][i] / num_frame_data));
+      float evm_snr_db =
+          (-10.0f *
+           std::log10(evm_buffer_[frame_id % kFrameWnd][i] / num_frame_data));
+      ss << "," << ((ue_map.at(i) != 0) ? std::to_string(evm_snr_db) : "ns");
     }
     logger_evm_snr_.Write(ss.str());
   }
 }
 
-void PhyStats::RecordDlPilotSnr(size_t frame_id) {
+void PhyStats::RecordDlPilotSnr(size_t frame_id, const arma::uvec& ue_map) {
   if (kEnableCsvLog) {
     const size_t dl_pilots_num = config_->Frame().ClientDlPilotSymbols();
     if (dl_pilots_num > 0) {
@@ -384,9 +404,20 @@ void PhyStats::RecordDlPilotSnr(size_t frame_id) {
       for (size_t i = 0; i < config_->UeAntNum(); i++) {
         for (size_t j = 0; j < dl_pilots_num; j++) {
           const size_t idx_offset = i * dl_pilots_num + j;
-          ss_snr << "," << dl_pilot_snr_[frame_slot][idx_offset];
-          ss_rssi << "," << dl_pilot_rssi_[frame_slot][idx_offset];
-          ss_noise << "," << dl_pilot_noise_[frame_slot][idx_offset];
+          ss_snr << ","
+                 << (ue_map.at(i) != 0
+                         ? std::to_string(dl_pilot_snr_[frame_slot][idx_offset])
+                         : "ns");
+          ss_rssi << ","
+                  << (ue_map.at(i) != 0
+                          ? std::to_string(
+                                dl_pilot_rssi_[frame_slot][idx_offset])
+                          : "ns");
+          ss_noise << ","
+                   << (ue_map.at(i) != 0
+                           ? std::to_string(
+                                 dl_pilot_noise_[frame_slot][idx_offset])
+                           : "ns");
         }
       }
       logger_bf_snr_.Write(ss_snr.str());
@@ -397,12 +428,13 @@ void PhyStats::RecordDlPilotSnr(size_t frame_id) {
 }
 
 void PhyStats::RecordDlCsi(size_t frame_id, size_t num_rec_sc,
-                           const Table<complex_float>& csi_buffer) {
+                           const Table<complex_float>& csi_buffer,
+                           const arma::uvec& ue_list) {
   if (kEnableCsvLog) {
     const size_t csi_offset_base = (frame_id % kFrameWnd) * config_->UeAntNum();
     std::stringstream ss;
     ss << frame_id;
-    for (size_t ue_id = 0; ue_id < config_->UeAntNum(); ue_id++) {
+    for (long long unsigned ue_id : ue_list) {
       const auto* csi_buffer_ptr = reinterpret_cast<const arma::cx_float*>(
           csi_buffer.At(csi_offset_base + ue_id));
       const size_t sc_step = config_->OfdmDataNum() / num_rec_sc;
@@ -416,7 +448,7 @@ void PhyStats::RecordDlCsi(size_t frame_id, size_t num_rec_sc,
   }
 }
 
-void PhyStats::RecordBer(size_t frame_id) {
+void PhyStats::RecordBer(size_t frame_id, const arma::uvec& ue_map) {
   if (kEnableCsvLog) {
     std::stringstream ss;
     ss << frame_id;
@@ -424,8 +456,12 @@ void PhyStats::RecordBer(size_t frame_id) {
     for (size_t i = 0; i < config_->UeAntNum(); i++) {
       size_t& error_bits = frame_bit_errors_[i][frame_slot];
       size_t& total_bits = frame_decoded_bits_[i][frame_slot];
-      ss << ","
-         << (static_cast<float>(error_bits) / static_cast<float>(total_bits));
+      if (ue_map.at(i) != 0) {
+        ss << ","
+           << (static_cast<float>(error_bits) / static_cast<float>(total_bits));
+      } else {
+        ss << ", ns";
+      }
       error_bits = 0;
       total_bits = 0;
     }
@@ -433,7 +469,7 @@ void PhyStats::RecordBer(size_t frame_id) {
   }
 }
 
-void PhyStats::RecordSer(size_t frame_id) {
+void PhyStats::RecordSer(size_t frame_id, const arma::uvec& ue_map) {
   if (kEnableCsvLog) {
     std::stringstream ss;
     ss << frame_id;
@@ -441,9 +477,13 @@ void PhyStats::RecordSer(size_t frame_id) {
     for (size_t i = 0; i < config_->UeAntNum(); i++) {
       size_t& error_symbols = frame_symbol_errors_[i][frame_slot];
       size_t& total_symbols = frame_decoded_symbols_[i][frame_slot];
-      ss << ","
-         << (static_cast<float>(error_symbols) /
-             static_cast<float>(total_symbols));
+      if (ue_map.at(i) != 0) {
+        ss << ","
+           << (static_cast<float>(error_symbols) /
+               static_cast<float>(total_symbols));
+      } else {
+        ss << ", ns";
+      }
       error_symbols = 0;
       total_symbols = 0;
     }
@@ -532,22 +572,36 @@ void PhyStats::UpdateCsiCond(size_t frame_id, size_t sc_id, float cond) {
 }
 
 void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
-                         const arma::cx_fvec& eq_vec) {
-  const arma::fvec evm_vec = arma::square(
-      arma::abs(eq_vec - gt_cube_.slice(data_symbol_id).col(sc_id)));
-  for (size_t ue_id = 0; ue_id < config_->UeAntNum(); ue_id++) {
-    evm_sc_buffer_[frame_id % kFrameWnd]
-                  [ue_id * config_->OfdmDataNum() + sc_id] = evm_vec(ue_id);
+                         const arma::cx_fvec& eq_vec,
+                         const arma::uvec& ue_list) {
+  size_t sched_id = data_symbol_id;
+  if (config_->AdaptUes()) {
+    mac_sched_->UpdateScheduler(frame_id);
+    sched_id += mac_sched_->SelectedGroup() * num_rxdata_symbols_;
+  }
+  arma::cx_fvec tx_data = gt_cube_.slice(sched_id).col(sc_id);
+  arma::fvec evm_vec = arma::square(arma::abs(eq_vec - tx_data(ue_list)));
+  if (kEnableCsvLog) {
+    for (const auto& ue_id : ue_list) {
+      const size_t ue_offset = ue_id * config_->OfdmDataNum();
+      evm_sc_buffer_[frame_id % kFrameWnd][ue_offset + sc_id] =
+          evm_vec.at(ue_id);
+    }
   }
   arma::fvec evm_buf(evm_buffer_[frame_id % kFrameWnd], config_->UeAntNum(),
                      false);
-  evm_buf += evm_vec;
+  evm_buf(ue_list) += evm_vec;
 }
 
 void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
                          size_t tx_ue_id, size_t rx_ue_id, arma::cx_float eq) {
-  const float evm =
-      std::norm(eq - gt_cube_.slice(data_symbol_id)(tx_ue_id, sc_id));
+  size_t sched_id = data_symbol_id;
+  if (config_->AdaptUes()) {
+    mac_sched_->UpdateScheduler(frame_id);
+    sched_id += mac_sched_->SelectedGroup() * num_rxdata_symbols_;
+  }
+  arma::cx_float tx_data = gt_cube_.slice(sched_id).at(tx_ue_id, sc_id);
+  const float evm = std::norm(eq - tx_data);
   evm_buffer_[frame_id % kFrameWnd][rx_ue_id] += evm;
   evm_sc_buffer_[frame_id % kFrameWnd]
                 [rx_ue_id * config_->OfdmDataNum() + sc_id] = evm;
@@ -556,7 +610,7 @@ void PhyStats::UpdateEvm(size_t frame_id, size_t data_symbol_id, size_t sc_id,
 void PhyStats::UpdateBitErrors(size_t ue_id, size_t offset, size_t frame_slot,
                                uint8_t tx_byte, uint8_t rx_byte) {
   static constexpr size_t kBitsInByte = 8;
-  AGORA_LOG_TRACE("Updating bit errors: User %zu Offset  %zu Tx %d Rx %d\n",
+  AGORA_LOG_FRAME("Updating bit errors: User %zu Offset  %zu Tx %d Rx %d\n",
                   ue_id, offset, tx_byte, rx_byte);
   uint8_t xor_byte(tx_byte ^ rx_byte);
   size_t bit_errors = 0;
@@ -629,9 +683,34 @@ void PhyStats::UpdateCalibMat(size_t frame_id, size_t sc_id,
   logger_calib_.UpdateMatBuf(frame_id, sc_id, vec_in);
 }
 
-float PhyStats::GetNoise(size_t frame_id) {
+float PhyStats::GetNoise(size_t frame_id, const arma::uvec& ue_list) {
   arma::fvec noise_vec(pilot_noise_[frame_id % kFrameWnd],
                        config_->BsAntNum() * config_->UeAntNum(), false);
 
-  return (arma::mean(noise_vec));
+  return arma::as_scalar(arma::mean(noise_vec(ue_list)));
+}
+
+std::vector<float> PhyStats::GetMaxSnrPerUes(size_t frame_id) {
+  std::vector<float> max_snr_per_ues(config_->UeAntNum());
+  for (size_t i = 0; i < config_->UeAntNum(); i++) {
+    float max_snr = FLT_MIN;
+    const float* frame_snr =
+        &pilot_snr_[frame_id % kFrameWnd][i * config_->BsAntNum()];
+    for (size_t j = 0; j < config_->BsAntNum(); j++) {
+      const size_t radio_id = j / config_->NumChannels();
+      const size_t cell_id = config_->CellId().at(radio_id);
+      if (config_->ExternalRefNode(cell_id) == true &&
+          radio_id == config_->RefRadio(cell_id)) {
+        continue;
+      }
+      if (frame_snr[j] > max_snr) {
+        max_snr = frame_snr[j];
+      }
+    }
+    if (max_snr == FLT_MIN) {
+      max_snr = -100;
+    }
+    max_snr_per_ues.at(i) = max_snr;
+  }
+  return max_snr_per_ues;
 }

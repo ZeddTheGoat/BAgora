@@ -1,4 +1,4 @@
-[![Build Status](https://falcon.ecg.rice.edu:443/buildStatus/icon?job=github_public_agora%2Fmaster)](https://falcon.ecg.rice.edu:443/job/github_public_agora/job/master/)
+[![Build Status](https://falcon.ecg.rice.edu:443/buildStatus/icon?job=github_public_agora%2Fdevelop)](https://falcon.ecg.rice.edu:443/job/github_public_agora/job/develop/)
 
 Agora is a complete software realization of real-time massive MIMO baseband processing. 
 
@@ -23,7 +23,7 @@ Some highlights:
  
  
 # Building Agora
-  Agora currently only builds and runs on Linux, and has been tested on Ubuntu 16.04, 18.04, and 20.04. 
+  Agora currently only builds and runs on Linux, and has been tested on Ubuntu 16.04, 18.04, 20.04 (Recommended), and 22.04 LTS. 
   Agora requires CMake 2.8+ and works with both GNU and Intel compilers with C++17 support. 
 ## Setting up the build environment
   * Setup CI: run

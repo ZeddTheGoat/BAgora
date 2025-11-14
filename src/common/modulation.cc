@@ -39,27 +39,30 @@ void Print128Epi8(__m128i var) {
  ***********************************************************************************
  */
 
-void InitModulationTable(Table<complex_float>& mod_table, size_t mod_order) {
+void InitModulationTable(Table<complex_float>& mod_table,
+                         size_t mod_order_bits) {
   if (!mod_table.IsAllocated()) {
     mod_table.Malloc(1, pow(2, kMaxModType),
                      Agora_memory::Alignment_t::kAlign32);
   }
   // mod_table.malloc(pow(2, kMaxModType), 2, 32);
-  switch (mod_order) {
-    case 4:
+  switch (mod_order_bits) {
+    case 2:
       InitQpskTable(mod_table);
       break;
-    case 16:
+    case 4:
       InitQam16Table(mod_table);
       break;
-    case 64:
+    case 6:
       InitQam64Table(mod_table);
       break;
-    case 256:
+    case 8:
       InitQam256Table(mod_table);
       break;
     default: {
-      std::printf("Modulation order not supported, use default value 4\n");
+      std::printf(
+          "Modulation order %zu not supported, use default value 4 (16QAM)\n",
+          mod_order_bits);
       InitQam16Table(mod_table);
     }
   }
@@ -274,6 +277,58 @@ void DemodQpskHardLoop(const float* vec_in, uint8_t* vec_out, int num) {
       *(vec_out + i) |= 1UL;
     }
   }
+}
+
+void DemodQpskSoftAvx2(float* vec_in, int8_t* llr, int num) {
+  float* symbols_ptr = vec_in;
+  auto* result_ptr = reinterpret_cast<__m256i*>(llr);
+  __m256 symbol1;
+  __m256 symbol2;
+  __m256 symbol3;
+  __m256 symbol4;
+  __m256i symbol_i1;
+  __m256i symbol_i2;
+  __m256i symbol_i3;
+  __m256i symbol_i4;
+  __m256i symbol_12;
+  __m256i symbol_34;
+  __m256i symbol_i;
+  __m256 scale_v = _mm256_set1_ps(-SCALE_BYTE_CONV_QPSK * M_SQRT2);
+
+  for (int i = 0; i < num / 16; i++) {
+    symbol1 = _mm256_load_ps(symbols_ptr);
+    symbols_ptr += 8;
+    symbol2 = _mm256_load_ps(symbols_ptr);
+    symbols_ptr += 8;
+    symbol3 = _mm256_load_ps(symbols_ptr);
+    symbols_ptr += 8;
+    symbol4 = _mm256_load_ps(symbols_ptr);
+    symbols_ptr += 8;
+    symbol_i1 = _mm256_cvtps_epi32(_mm256_mul_ps(symbol1, scale_v));
+    symbol_i2 = _mm256_cvtps_epi32(_mm256_mul_ps(symbol2, scale_v));
+    symbol_i3 = _mm256_cvtps_epi32(_mm256_mul_ps(symbol3, scale_v));
+    symbol_i4 = _mm256_cvtps_epi32(_mm256_mul_ps(symbol4, scale_v));
+    symbol_12 = _mm256_packs_epi32(symbol_i1, symbol_i2);
+    symbol_12 = _mm256_permute4x64_epi64(symbol_12, 0xd8);
+    symbol_34 = _mm256_packs_epi32(symbol_i3, symbol_i4);
+    symbol_34 = _mm256_permute4x64_epi64(symbol_34, 0xd8);
+    symbol_i = _mm256_packs_epi16(symbol_12, symbol_34);
+    symbol_i = _mm256_permute4x64_epi64(symbol_i, 0xd8);
+
+    if (((size_t)(llr)&0x1F) == 0) {
+      _mm256_store_si256(result_ptr, symbol_i);
+    } else {
+      _mm256_storeu_si256(result_ptr, symbol_i);
+    }
+    result_ptr++;
+  }
+  // Demodulate last symbols
+  int next_start = 2 * 16 * (num / 16);
+  for (int i = next_start; i < 2 * num; i++) {
+    llr[i] = (int8_t)(vec_in[i] * -SCALE_BYTE_CONV_QPSK * M_SQRT2);
+  }
+  /*DemodQpskSoftSse(vec_in + next_start, llr + next_start,
+                   num - next_start);*/
 }
 
 // /**
@@ -2749,3 +2804,36 @@ void Demod256qamSoftAvx512(const float* vec_in, int8_t* llr, int num) {
                       num - next_start);
 }
 #endif
+
+void Demodulate(float* equal_ptr, int8_t* demod_ptr, size_t data_num,
+                size_t mod, bool hard_demod) {
+  switch (mod) {
+    case 2:
+      hard_demod
+          ? DemodQpskHardLoop(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
+                              data_num)
+          : DemodQpskSoftAvx2(equal_ptr, demod_ptr, data_num);
+      break;
+    case 4:
+      hard_demod
+          ? Demod16qamHardAvx2(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
+                               data_num)
+          : Demod16qamSoftAvx2(equal_ptr, demod_ptr, data_num);
+      break;
+    case 6:
+      hard_demod
+          ? Demod64qamHardAvx2(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
+                               data_num)
+          : Demod64qamSoftAvx2(equal_ptr, demod_ptr, data_num);
+      break;
+    case 8:
+      hard_demod
+          ? Demod256qamHardAvx2(equal_ptr,
+                                reinterpret_cast<uint8_t*>(demod_ptr), data_num)
+          : Demod256qamSoftAvx2(equal_ptr, demod_ptr, data_num);
+      break;
+    default:
+      std::printf("Demodulation: modulation type %s not supported!\n",
+                  MapModToStr(mod).c_str());
+  }
+}

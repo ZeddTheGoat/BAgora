@@ -17,15 +17,19 @@
 // is the frame window that we track in Agora.
 static constexpr size_t kFrameWnd = 40;
 
+// Fixed number of 14 symbols per frame from 3GPP
+static constexpr size_t kNumSymbolsPerFrame = 14;
+
 #define TX_FRAME_DELTA (4)
 #define SETTLE_TIME_MS (1)
 
 // Just-in-time optimization for MKL cgemm is available only after MKL 2019
 // update 3. Disable this on systems with an older MKL version.
 #if __INTEL_MKL__ >= 2020 || (__INTEL_MKL__ == 2019 && __INTEL_MKL_UPDATE__ > 3)
-#define USE_MKL_JIT (1)
+#define USE_MKL_CBLAS (1)
 #else
 #undef USE_MKL_JIT
+#undef USE_MKL_CBLAS
 #endif
 
 //Define to allow mac addition of RB IND to allow dynamic change of mcs
@@ -54,15 +58,40 @@ enum class EventType : int {
   kModul,
   kPacketFromMac,
   kPacketToMac,
+  kPacketFromRp,
+  kPacketToRp,
   kFFTPilot,
   kSNRReport,    // Signal new SNR measurement from PHY to MAC
   kRANUpdate,    // Signal new RAN config to Agora
   kRBIndicator,  // Signal RB schedule to UEs
+  kBroadcast,    // Signal generation of new broadcast symbols
   kThreadTermination
 };
 
 static constexpr size_t kNumEventTypes =
     static_cast<size_t>(EventType::kThreadTermination) + 1;
+
+// Define a mapping from EventType to string
+static const std::array<std::string, kNumEventTypes> kEventTypeToString = {
+    "PacketRX",
+    "FFT",
+    "Beam",
+    "Demul",
+    "IFFT",
+    "Precode",
+    "PacketTX",
+    "PacketPilotTX",
+    "Decode",
+    "Encode",
+    "Modul",
+    "PacketFromMac",
+    "PacketToMac",
+    "FFTPilot",
+    "SNRReport",
+    "RANUpdate",
+    "RBIndicator",
+    "Broadcast",
+    "ThreadTermination"};
 
 // Types of Agora Doers
 enum class DoerType : size_t {
@@ -73,6 +102,7 @@ enum class DoerType : size_t {
   kDecode,
   kEncode,
   kIFFT,
+  kBroadcast,
   kPrecode,
   kRC
 };
@@ -103,6 +133,7 @@ enum class PrintType : int {
   kBeam,
   kDemul,
   kIFFT,
+  kBroadcast,
   kPrecode,
   kPacketTXFirst,
   kPacketTX,
@@ -195,7 +226,7 @@ static constexpr bool kDownlinkHardDemod = false;
 static constexpr bool kUplinkHardDemod = false;
 
 static constexpr bool kExportConstellation = false;
-static constexpr bool kPrintPhyStats = true;
+static constexpr bool kPrintPhyStats = !kEnableMac;
 static constexpr bool kCollectPhyStats = true;
 static constexpr bool kPrintBeamStats = true;
 
@@ -212,7 +243,8 @@ static constexpr bool kRecordCalibrationMats = false;
 static constexpr bool kDebugRadioTX = false;
 static constexpr bool kDebugRadioRX = false;
 
-static constexpr bool kLogMacPackets = false;
+static constexpr bool kLogTxMacPackets = true;
+static constexpr bool kLogRxMacPackets = true;
 
 enum class ThreadType {
   kMaster,
@@ -225,6 +257,7 @@ enum class ThreadType {
   kWorkerTX,
   kWorkerTXRX,
   kWorkerMacTXRX,
+  kWorkerRpTXRX,
   kMasterRX,
   kMasterTX,
   kRecorderWorker
@@ -252,6 +285,8 @@ static inline std::string ThreadTypeStr(ThreadType thread_type) {
       return "TXRX";
     case ThreadType::kWorkerMacTXRX:
       return "MAC TXRX";
+    case ThreadType::kWorkerRpTXRX:
+      return "RP TXRX";
     case ThreadType::kMasterRX:
       return "Master (RX)";
     case ThreadType::kMasterTX:
@@ -264,6 +299,7 @@ static inline std::string ThreadTypeStr(ThreadType thread_type) {
 
 enum class SymbolType {
   kBeacon,
+  kControl,
   kUL,
   kDL,
   kPilot,
@@ -272,16 +308,23 @@ enum class SymbolType {
   kGuard,
   kUnknown
 };
+
 static const std::map<char, SymbolType> kSymbolMap = {
     {'B', SymbolType::kBeacon}, {'C', SymbolType::kCalDL},
     {'D', SymbolType::kDL},     {'G', SymbolType::kGuard},
     {'L', SymbolType::kCalUL},  {'P', SymbolType::kPilot},
-    {'U', SymbolType::kUL}};
+    {'U', SymbolType::kUL},     {'S', SymbolType::kControl}};
 
-enum class SubcarrierType { kNull, kDMRS, kData };
+enum class SubcarrierType { kNull, kDMRS, kPTRS, kData };
+
+// Maximum number of events allowed for all threads per symbol in a logging frame
+static constexpr size_t kMaxLoggingEventsMaster = 100000;
+
+// Maximum number of events allowed per thread per symbol in a logging frame
+static constexpr size_t kMaxLoggingEventsWorker = 1024;
 
 // Maximum number of symbols per frame allowed by Agora
-static constexpr size_t kMaxSymbols = 70;
+static constexpr size_t kMaxSymbols = 140;
 
 // Maximum number of OFDM data subcarriers in the 5G spec
 static constexpr size_t kMaxDataSCs = 3300;
@@ -300,6 +343,11 @@ static constexpr size_t kMaxChannels = 2;
 // helps reduce false cache line sharing.
 static constexpr size_t kMaxModType = 8;
 
+// An arbitrary setting for default Mcs for Data symbols
+// 16QAM modulation and 340/1024 code rate
+static constexpr size_t kDefaultMcsIndex = 10;
+static constexpr size_t kMaxMcsIndex = 31;
+
 // Number of cellular frames tracked by Agora stats
 static constexpr size_t kNumStatsFrames = 10000;
 
@@ -308,6 +356,9 @@ static constexpr bool kIsWorkerTimingEnabled = true;
 
 // Maximum breakdown of a statistic (e.g., timing)
 static constexpr size_t kMaxStatsBreakdown = 4;
+
+// Minimum number of workers
+static constexpr size_t kMinWorkers = 1;
 
 // Maximum number of hardware threads on one machine
 static constexpr size_t kMaxThreads = 128;
@@ -334,6 +385,9 @@ static constexpr size_t kMacBaseRemotePort = 8080;
 // Agora listens for UDP packets (downlink data packets at the server) at
 // port kBaseLocalPort
 static constexpr size_t kMacBaseLocalPort = 8180;
+
+static constexpr size_t kAppUserLocalPort = 1350u;
+static constexpr size_t kAppBaseLocalPort = 1450u;
 
 // Agora sends control information over an out-of-band control channel
 // to each UE #i, at port kBaseClientPort + i
@@ -367,4 +421,5 @@ static constexpr size_t kOfdmSymbolPerSlot = 1;
 static constexpr size_t kOutputFrameNum = 1;
 
 static constexpr bool kDebugTxData = false;
+static constexpr bool kDebugBypassEncode = false;
 #endif  // SYMBOLS_H_

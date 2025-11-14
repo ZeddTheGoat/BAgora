@@ -46,15 +46,17 @@ enum class TsType : size_t {
   kBeamDone,           // Completed zeroforcing for this frame
   kDemulDone,          // Completed demodulation for this frame
   kRXDone,             // All packets of a frame received
-  kRCDone,             // Recirocity Calibration Computation done
-  kEncodeDone,
-  kDecodeDone,  // Completed all LDPC decoding for this frame
-  kPrecodeDone,
-  kIFFTDone,
-  kTXProcessedFirst,
-  kTXDone,
-  kModulDone,
-  kFFTDone,
+  kRCDone,             // Reciprocity Calibration Computation done
+  kEncodeDone,         // Completed all LDPC encoding for this frame
+  kDecodeDone,         // Completed all LDPC decoding for this frame
+  kPrecodeDone,        // Completed precoding for this frame
+  kIFFTDone,           // Completed IFFT of data symbols for this frame
+  kBroadcastDone,      // Completed broadcast for this frame
+  kTXProcessedFirst,   // First symbol in packet transmitted
+  kTXDone,             // All packets of a frame transmitted
+  kModulDone,          // Completed modulation for this frame
+  kFFTDone,            // Completed FFT of data symbols for this frame
+  kSymbolRX,           // RX Symbol received
   kTsTypeEnd
 };
 static constexpr size_t kNumTimestampTypes =
@@ -69,9 +71,34 @@ class Stats {
   /// stats for all uplink and donwlink Doer types. Else return immediately.
   void UpdateStats(size_t frame_id);
 
+  /// Measure the last frame latency
+  /// Time taken with decoding - time starting process
+  double MeasureLastFrameLatency();
+
   /// Save master timestamps to a file. If worker stats collection is enabled,
   /// also save detailed worker timing info to a file.
   void SaveToFile();
+
+  /// From the master, set the RDTSC timestamp for a frame ID, symbol ID and
+  /// timestamp type
+  void MasterSetTscSymbol(TsType timestamp_type, size_t frame_id,
+                          size_t symbol_id, size_t block_id) {
+    this->master_timestamps_symbols_.at(static_cast<size_t>(timestamp_type))
+        .at(frame_id % kNumStatsFrames)
+        .at(symbol_id % kNumSymbolsPerFrame)
+        .at(block_id % kMaxDataSCs) = GetTime::Rdtsc();
+  }
+
+  /// From the master, get the RDTSC timestamp for a frame ID and timestamp
+  /// type
+  size_t MasterGetTscSymbol(TsType timestamp_type, size_t frame_id,
+                            size_t symbol_id, size_t block_id) const {
+    return this->master_timestamps_symbols_
+        .at(static_cast<size_t>(timestamp_type))
+        .at(frame_id % kNumStatsFrames)
+        .at(symbol_id % kNumSymbolsPerFrame)
+        .at(block_id % kMaxDataSCs);
+  }
 
   /// If worker stats collection is enabled, prsize_t a summary of stats
   void PrintSummary();
@@ -87,7 +114,7 @@ class Stats {
   /// type
   size_t MasterGetTsc(TsType timestamp_type, size_t frame_id) const {
     return this->master_timestamps_.at(static_cast<size_t>(timestamp_type))
-        .at((frame_id % kNumStatsFrames));
+        .at(frame_id % kNumStatsFrames);
   }
 
   /// From the master, get the millisecond elapsed since the timestamp of
@@ -103,6 +130,17 @@ class Stats {
   double MasterGetUsSince(TsType timestamp_type, size_t frame_id) const {
     return GetTime::CyclesToUs(
         GetTime::Rdtsc() - MasterGetTsc(timestamp_type, frame_id),
+        this->freq_ghz_);
+  }
+
+  /// From the master, get the microseconds between when the timestamp of
+  /// timestamp_type was taken for frame_id, symbol_id and reference_tsc
+  double MasterGetUsSymbolFromRef(TsType timestamp_type, size_t frame_id,
+                                  size_t symbol_id, size_t cb_id,
+                                  size_t reference_tsc) const {
+    return GetTime::CyclesToUs(
+        MasterGetTscSymbol(timestamp_type, frame_id, symbol_id, cb_id) -
+            reference_tsc,
         this->freq_ghz_);
   }
 
@@ -178,6 +216,102 @@ class Stats {
   /// starts receiving frame j.
   inline Table<size_t>& FrameStart() { return this->frame_start_; };
 
+  // Task enqueue/dequeue start and end timestamps and task type
+  struct QueueTsStat {
+    EventType event_type_;
+    size_t tsc_start_ = 0;  // Unit = TSC cycles
+    size_t tsc_end_ = 0;    // Unit = TSC cycles
+  };
+
+  std::array<std::array<QueueTsStat, kMaxLoggingEventsMaster>, kMaxSymbols>
+      enqueue_stats_;
+  std::array<QueueTsStat, kMaxLoggingEventsMaster> dequeue_stats_;
+  std::array<size_t, kMaxSymbols> enqueue_stats_id_ = {};
+  size_t dequeue_stats_id_ = 0;
+
+  std::array<std::array<size_t, kNumStatsFrames>, kMaxThreads>
+      total_worker_dequeue_tsc_ = {};
+  std::array<std::array<size_t, kNumStatsFrames>, kMaxThreads>
+      total_worker_enqueue_tsc_ = {};
+  std::array<std::array<size_t, kNumStatsFrames>, kMaxThreads>
+      total_worker_valid_dequeue_tsc_ = {};
+  std::array<std::array<size_t, kNumStatsFrames>, kMaxThreads>
+      worker_num_valid_enqueue_ = {};
+
+  std::array<
+      std::array<std::array<QueueTsStat, kMaxLoggingEventsWorker>, kMaxSymbols>,
+      kMaxThreads>
+      worker_enqueue_stats_;
+  std::array<
+      std::array<std::array<QueueTsStat, kMaxLoggingEventsWorker>, kMaxSymbols>,
+      kMaxThreads>
+      worker_dequeue_stats_;
+  std::array<std::array<size_t, kMaxSymbols>, kMaxThreads>
+      worker_enqueue_stats_id_ = {};
+  std::array<std::array<size_t, kMaxSymbols>, kMaxThreads>
+      worker_dequeue_stats_id_ = {};
+
+  inline void TryEnqueueLogStatsMaster(
+      moodycamel::ConcurrentQueue<EventData>* mc_queue,
+      moodycamel::ProducerToken* producer_token, const EventData& event,
+      size_t frame_to_profile, size_t frame_id, size_t symbol_id) {
+    size_t enqueue_start_tsc = 0;
+    if (frame_id == frame_to_profile) {
+      enqueue_start_tsc = GetTime::WorkerRdtsc();
+    }
+    TryEnqueueFallback(mc_queue, producer_token, event);
+    if (frame_id == frame_to_profile) {
+      enqueue_stats_.at(symbol_id)
+          .at(enqueue_stats_id_.at(symbol_id))
+          .tsc_end_ = GetTime::WorkerRdtsc();
+      enqueue_stats_.at(symbol_id)
+          .at(enqueue_stats_id_.at(symbol_id))
+          .tsc_start_ = enqueue_start_tsc;
+      enqueue_stats_.at(symbol_id)
+          .at(enqueue_stats_id_.at(symbol_id))
+          .event_type_ = event.event_type_;
+
+      enqueue_stats_id_.at(symbol_id)++;
+      //This is 1 before an overflow since we don't actually write to this position until the next call
+      RtAssert(enqueue_stats_id_.at(symbol_id) < kMaxLoggingEventsMaster,
+               "Stats ID exceeds array bounds");
+    }
+  };
+
+  inline void LogDequeueStatsMaster(EventType event_type,
+                                    size_t tsc_dequeue_start,
+                                    size_t tsc_dequeue_end) {
+    dequeue_stats_[dequeue_stats_id_].tsc_start_ = tsc_dequeue_start;
+    dequeue_stats_[dequeue_stats_id_].tsc_end_ = tsc_dequeue_end;
+    dequeue_stats_[dequeue_stats_id_].event_type_ = event_type;
+    dequeue_stats_id_++;
+  }
+
+  inline void LogDequeueStatsWorker(int tid, size_t frame_id, size_t symbol_id,
+                                    size_t start_tsc, size_t end_tsc,
+                                    size_t diff_tsc, size_t valid_diff_tsc,
+                                    EventType event_type) {
+    size_t id = worker_dequeue_stats_id_[tid][symbol_id];
+    worker_dequeue_stats_[tid][symbol_id][id].tsc_start_ = start_tsc;
+    worker_dequeue_stats_[tid][symbol_id][id].tsc_end_ = end_tsc;
+    worker_dequeue_stats_[tid][symbol_id][id].event_type_ = event_type;
+    worker_dequeue_stats_id_[tid][symbol_id]++;
+    total_worker_dequeue_tsc_[tid][frame_id] += diff_tsc;
+    total_worker_valid_dequeue_tsc_[tid][frame_id] += valid_diff_tsc;
+  }
+
+  inline void LogEnqueueStatsWorker(int tid, size_t frame_id, size_t symbol_id,
+                                    size_t start_tsc, size_t end_tsc,
+                                    size_t diff_tsc, EventType event_type) {
+    size_t id = worker_enqueue_stats_id_[tid][symbol_id];
+    worker_enqueue_stats_[tid][symbol_id][id].tsc_start_ = start_tsc;
+    worker_enqueue_stats_[tid][symbol_id][id].tsc_end_ = end_tsc;
+    worker_enqueue_stats_[tid][symbol_id][id].event_type_ = event_type;
+    worker_enqueue_stats_id_[tid][symbol_id]++;
+    total_worker_enqueue_tsc_[tid][frame_id] += diff_tsc;
+    worker_num_valid_enqueue_[tid][frame_id]++;
+  }
+
  private:
   // Fill in running time summary stats for the current frame for this
   // thread and Doer type
@@ -209,6 +343,14 @@ class Stats {
   std::array<std::array<double, kNumStatsFrames>, kNumTimestampTypes>
       master_timestamps_;
 
+  /// Timestamps taken by the master thread at different points in a symbols's
+  /// processing
+  std::array<std::array<std::array<std::array<double, kMaxDataSCs>,
+                                   kNumSymbolsPerFrame>,
+                        kNumStatsFrames>,
+             kNumTimestampTypes>
+      master_timestamps_symbols_;
+
   /// Running time duration statistics. Each worker thread has one
   /// DurationStat object for every Doer type. The master thread keeps stale
   /// ("old") copies of all DurationStat objects.
@@ -217,6 +359,7 @@ class Stats {
     std::array<uint8_t, 64> false_sharing_padding_;
   };
 
+  std::array<double, kNumStatsFrames> doer_sum_us_;
   std::array<TimeDurationsStats, kMaxThreads> worker_durations_;
   std::array<TimeDurationsStats, kMaxThreads> worker_durations_old_;
 

@@ -30,7 +30,8 @@ static constexpr bool kPrintEqualizedSymbols = false;
 static constexpr bool kDebugTxMemory = false;
 
 UeWorker::UeWorker(
-    size_t tid, Config& config, Stats& shared_stats, PhyStats& shared_phy_stats,
+    size_t tid, Config& config, MacScheduler& mac_scheduler,
+    Stats& shared_stats, PhyStats& shared_phy_stats,
     moodycamel::ConcurrentQueue<EventData>& notify_queue,
     moodycamel::ConcurrentQueue<EventData>& work_queue,
     moodycamel::ProducerToken& work_producer, Table<int8_t>& ul_bits_buffer,
@@ -47,6 +48,7 @@ UeWorker::UeWorker(
       work_queue_(work_queue),
       work_producer_token_(work_producer),
       config_(config),
+      mac_sched_(mac_scheduler),
       stats_(shared_stats),
       phy_stats_(shared_phy_stats),
       ul_bits_buffer_(ul_bits_buffer),
@@ -63,7 +65,9 @@ UeWorker::UeWorker(
       decoded_buffer_(decoded_buffer),
       ue_pilot_vec_(ue_pilot_vec) {
   ptok_ = std::make_unique<moodycamel::ProducerToken>(notify_queue);
-
+  // Has to be called separately in case
+  // LoadTestVector cannot be called, e.g. in unit tests
+  phy_stats_.LoadGroundTruthIq();
   AllocBuffer1d(&rx_samps_tmp_, config_.SampsPerSymbol(),
                 Agora_memory::Alignment_t::kAlign64, 1);
 
@@ -97,16 +101,15 @@ void UeWorker::TaskThread(size_t core_offset) {
   PinToCoreWithOffset(ThreadType::kWorker, core_offset, tid_);
 
   auto encoder = std::make_unique<DoEncode>(
-      &config_, (int)tid_, Direction::kUplink,
-      (kEnableMac == true) ? ul_bits_buffer_ : config_.UlBits(),
-      (kEnableMac == true) ? kFrameWnd : 1, encoded_buffer_, &stats_);
+      &config_, (int)tid_, Direction::kUplink, ul_bits_buffer_, encoded_buffer_,
+      &mac_sched_, &stats_);
 
   auto iffter = std::make_unique<DoIFFTClient>(
       &config_, (int)tid_, ifft_buffer_, tx_buffer_, &stats_);
 
-  auto decoder =
-      std::make_unique<DoDecodeClient>(&config_, (int)tid_, demod_buffer_,
-                                       decoded_buffer_, &phy_stats_, &stats_);
+  auto decoder = std::make_unique<DoDecodeClient>(
+      &config_, (int)tid_, demod_buffer_, decoded_buffer_, &mac_sched_,
+      &phy_stats_, &stats_);
 
   EventData event;
   while (config_.Running() == true) {
@@ -157,13 +160,14 @@ void UeWorker::DoFftPilot(size_t tag) {
   const size_t symbol_id = pkt->symbol_id_;
   const size_t ant_id = pkt->ant_id_;
   const size_t frame_slot = frame_id % kFrameWnd;
+  const size_t dl_symbol_id = config_.Frame().GetDLSymbolIdx(symbol_id);
+  const bool bypass_fft = config_.FreqDomainChannel();
 
   if (kDebugPrintInTask || kDebugPrintFft) {
     AGORA_LOG_INFO("UeWorker[%zu]: Fft Pilot(frame %zu, symbol %zu, ant %zu)\n",
                    tid_, frame_id, symbol_id, ant_id);
   }
 
-  const size_t dl_symbol_id = config_.Frame().GetDLSymbolIdx(symbol_id);
   const size_t sig_offset = config_.OfdmRxZeroPrefixClient();
 
   if (kPrintDownlinkPilotStats) {
@@ -186,7 +190,7 @@ void UeWorker::DoFftPilot(size_t tag) {
 
   // remove CP, do FFT
   size_t total_dl_symbol_id =
-      (frame_slot * config_.Frame().NumDLSyms()) + dl_symbol_id;
+      config_.GetTotalSymbolIdxDl(frame_id, dl_symbol_id);
   size_t fft_buffer_target_id =
       (total_dl_symbol_id * config_.UeAntNum()) + ant_id;
 
@@ -199,15 +203,13 @@ void UeWorker::DoFftPilot(size_t tag) {
   SimdConvertShortToFloat(&pkt->data_[delay_offset], fft_buff,
                           config_.OfdmCaNum() * 2);
 
-  // perform fft
-  DftiComputeForward(mkl_handle_, fft_buffer_[fft_buffer_target_id]);
+  if (bypass_fft == false) {
+    // perform fft
+    DftiComputeForward(mkl_handle_, fft_buffer_[fft_buffer_target_id]);
 
-  //// FFT shift the buffer
-  std::vector<complex_float> temp_fft_buf(config_.OfdmCaNum());
-  auto* temp_buff = reinterpret_cast<complex_float*>(temp_fft_buf.data());
-  auto* fft_buff_complex =
-      reinterpret_cast<complex_float*>(fft_buffer_[fft_buffer_target_id]);
-  CommsLib::FFTShift(fft_buff_complex, temp_buff, config_.OfdmCaNum());
+    //// FFT shift the buffer
+    CommsLib::FFTShift(fft_buffer_[fft_buffer_target_id], config_.OfdmCaNum());
+  }
 
   size_t csi_offset = frame_slot * config_.UeAntNum() + ant_id;
   auto* csi_buffer_ptr =
@@ -260,6 +262,7 @@ void UeWorker::DoFftData(size_t tag) {
   const size_t symbol_id = pkt->symbol_id_;
   const size_t ant_id = pkt->ant_id_;
   const size_t frame_slot = frame_id % kFrameWnd;
+  const bool bypass_fft = config_.FreqDomainChannel();
 
   if (kDebugPrintInTask || kDebugPrintFft) {
     AGORA_LOG_INFO("UeWorker[%zu]: Fft Data(frame %zu, symbol %zu, ant %zu)\n",
@@ -268,10 +271,12 @@ void UeWorker::DoFftData(size_t tag) {
 
   const size_t sig_offset = config_.OfdmRxZeroPrefixClient();
   const size_t dl_symbol_id = config_.Frame().GetDLSymbolIdx(symbol_id);
+  const size_t dl_data_symbol_id =
+      dl_symbol_id - config_.Frame().ClientDlPilotSymbols();
 
   // remove CP, do FFT
   size_t total_dl_symbol_id =
-      (frame_slot * config_.Frame().NumDLSyms()) + dl_symbol_id;
+      config_.GetTotalSymbolIdxDl(frame_id, dl_symbol_id);
   size_t fft_buffer_target_id =
       (total_dl_symbol_id * config_.UeAntNum()) + ant_id;
 
@@ -282,26 +287,22 @@ void UeWorker::DoFftData(size_t tag) {
   SimdConvertShortToFloat(&pkt->data_[delay_offset], fft_buff,
                           config_.OfdmCaNum() * 2);
 
-  // perform fft
-  DftiComputeForward(mkl_handle_, fft_buffer_[fft_buffer_target_id]);
+  if (bypass_fft == false) {
+    // perform fft
+    DftiComputeForward(mkl_handle_, fft_buffer_[fft_buffer_target_id]);
 
-  //// FFT shift the buffer
-  std::vector<complex_float> temp_fft_buf(config_.OfdmCaNum());
-  auto* temp_buff = reinterpret_cast<complex_float*>(temp_fft_buf.data());
-  auto* fft_buff_complex =
-      reinterpret_cast<complex_float*>(fft_buffer_[fft_buffer_target_id]);
-  CommsLib::FFTShift(fft_buff_complex, temp_buff, config_.OfdmCaNum());
+    //// FFT shift the buffer
+    CommsLib::FFTShift(fft_buffer_[fft_buffer_target_id], config_.OfdmCaNum());
+  }
 
+  auto* fft_buffer_ptr =
+      reinterpret_cast<arma::cx_float*>(fft_buffer_[fft_buffer_target_id]);
   size_t csi_offset = frame_slot * config_.UeAntNum() + ant_id;
   auto* csi_buffer_ptr =
       reinterpret_cast<arma::cx_float*>(csi_buffer_[csi_offset]);
-  auto* fft_buffer_ptr =
-      reinterpret_cast<arma::cx_float*>(fft_buffer_[fft_buffer_target_id]);
 
-  size_t dl_data_symbol_perframe = config_.Frame().NumDlDataSyms();
   size_t total_dl_data_symbol_id =
-      (frame_slot * dl_data_symbol_perframe) +
-      (dl_symbol_id - config_.Frame().ClientDlPilotSymbols());
+      config_.GetTotalDataSymbolIdxDl(frame_id, dl_data_symbol_id);
   size_t eq_buffer_offset =
       total_dl_data_symbol_id * config_.UeAntNum() + ant_id;
 
@@ -324,7 +325,12 @@ void UeWorker::DoFftData(size_t tag) {
     theta /= config_.GetOFDMPilotNum();
   }
   auto phc = exp(arma::cx_float(0, -theta));
-  float evm = 0;
+  float evms = 0;
+  size_t sched_id = dl_data_symbol_id;
+  if (config_.AdaptUes()) {
+    mac_sched_.UpdateScheduler(frame_id);
+    sched_id += mac_sched_.SelectedGroup() * config_.Frame().NumDlDataSyms();
+  }
   for (size_t j = 0; j < config_.OfdmDataNum(); j++) {
     if (config_.IsDataSubcarrier(j) == true) {
       // divide fft output by pilot data to get CSI estimation
@@ -334,22 +340,20 @@ void UeWorker::DoFftData(size_t tag) {
       equ_buffer_ptr[data_sc_id] = (y / csi_buffer_ptr[j]) * phc;
       size_t ant = (kDebugDownlink == true) ? 0 : ant_id;
       if (kCollectPhyStats) {
-        const size_t dl_data_symbol_id =
-            dl_symbol_id - config_.Frame().ClientDlPilotSymbols();
         phy_stats_.UpdateEvm(frame_id, dl_data_symbol_id, j, ant, ant_id,
                              equ_buffer_ptr[data_sc_id]);
       }
       complex_float tx =
-          config_.DlIqF()[dl_symbol_id][ant * config_.OfdmDataNum() + j];
-      evm +=
+          config_.DlIqF()[sched_id][ant * config_.OfdmDataNum() + j];
+      evms +=
           std::norm(equ_buffer_ptr[data_sc_id] - arma::cx_float(tx.re, tx.im));
     }
   }
 
-  evm = evm / config_.GetOFDMDataNum();
+  evms = evms / config_.GetOFDMDataNum();
   if (kPrintEqualizedSymbols) {
     complex_float* tx =
-        &config_.DlIqF()[dl_symbol_id][ant_id * config_.OfdmDataNum()];
+        &config_.DlIqF()[dl_data_symbol_id][ant_id * config_.OfdmDataNum()];
     arma::cx_fvec x_vec(reinterpret_cast<arma::cx_float*>(tx),
                         config_.OfdmDataNum(), false);
     Utils::PrintVec(x_vec, std::string("x") +
@@ -360,12 +364,11 @@ void UeWorker::DoFftData(size_t tag) {
                                    std::to_string(total_dl_symbol_id) +
                                    std::string("_") + std::to_string(ant_id));
   }
-  if (kPrintPhyStats) {
+  if (kPrintPhyStats && !kEnableMac) {
     AGORA_LOG_INFO("Frame: %zu, Symbol: %zu, User: %zu, EVM: %f, SNR: %f\n",
-                   frame_id, symbol_id, ant_id, (100.0f * evm),
-                   (-10.0f * std::log10(evm)));
+                   frame_id, symbol_id, ant_id, (100.0f * std::sqrt(evms)),
+                   (-10.0f * std::log10(evms)));
   }
-
   if (kDebugPrintPerTaskDone || kDebugPrintFft) {
     size_t fft_duration_stat = GetTime::Rdtsc() - start_tsc;
     AGORA_LOG_INFO(
@@ -386,70 +389,43 @@ void UeWorker::DoFftData(size_t tag) {
 
 void UeWorker::DoDemul(size_t tag) {
   // TODO: We assume one code block per ofdm symbol here
+  const size_t start_tsc = GetTime::Rdtsc();
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ant_id_;
-
   if (kDebugPrintInTask || kDebugPrintDemul) {
     AGORA_LOG_INFO("UeWorker[%zu]: Demul  (frame %zu, symbol %zu, ant %zu)\n",
                    tid_, frame_id, symbol_id, ant_id);
   }
-  const size_t start_tsc = GetTime::Rdtsc();
 
   const size_t frame_slot = frame_id % kFrameWnd;
   const size_t dl_symbol_id = config_.Frame().GetDLSymbolIdx(symbol_id);
-  const size_t dl_data_symbol_perframe = config_.Frame().NumDlDataSyms();
-  const size_t total_dl_symbol_id = frame_slot * dl_data_symbol_perframe +
-                                    dl_symbol_id -
-                                    config_.Frame().ClientDlPilotSymbols();
+  const size_t dl_data_symbol_id =
+      dl_symbol_id - config_.Frame().ClientDlPilotSymbols();
+  size_t total_dl_symbol_id =
+      config_.GetTotalDataSymbolIdxDl(frame_id, dl_data_symbol_id);
   size_t offset = total_dl_symbol_id * config_.UeAntNum() + ant_id;
   auto* equal_ptr = reinterpret_cast<float*>(&equal_buffer_[offset][0]);
 
   const size_t base_sc_id = 0;
 
-  int8_t* demod_ptr = demod_buffer_[frame_slot][dl_symbol_id][ant_id] +
-                      (config_.ModOrderBits(Direction::kDownlink) * base_sc_id);
+  int8_t* demod_ptr =
+      demod_buffer_[frame_slot][dl_data_symbol_id][ant_id] +
+      (mac_sched_.Params().ModOrderBits(Direction::kDownlink) * base_sc_id);
 
-  switch (config_.ModOrderBits(Direction::kDownlink)) {
-    case (CommsLib::kQpsk):
-      kDownlinkHardDemod
-          ? DemodQpskHardLoop(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
-                              config_.GetOFDMDataNum())
-          : DemodQpskSoftSse(equal_ptr, demod_ptr, config_.GetOFDMDataNum());
-      break;
-    case (CommsLib::kQaM16):
-      kDownlinkHardDemod
-          ? Demod16qamHardAvx2(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
-                               config_.GetOFDMDataNum())
-          : Demod16qamSoftAvx2(equal_ptr, demod_ptr, config_.GetOFDMDataNum());
-      break;
-    case (CommsLib::kQaM64):
-      kDownlinkHardDemod
-          ? Demod64qamHardAvx2(equal_ptr, reinterpret_cast<uint8_t*>(demod_ptr),
-                               config_.GetOFDMDataNum())
-          : Demod64qamSoftAvx2(equal_ptr, demod_ptr, config_.GetOFDMDataNum());
-      break;
-    case (CommsLib::kQaM256):
-      kDownlinkHardDemod
-          ? Demod256qamHardAvx2(equal_ptr,
-                                reinterpret_cast<uint8_t*>(demod_ptr),
-                                config_.GetOFDMDataNum())
-          : Demod256qamSoftAvx2(equal_ptr, demod_ptr, config_.GetOFDMDataNum());
-      break;
-    default:
-      AGORA_LOG_INFO(
-          "UeWorker[%zu]: Demul - modulation type %s not supported!\n", tid_,
-          config_.Modulation(Direction::kDownlink).c_str());
-  }
+  Demodulate(equal_ptr, demod_ptr, config_.GetOFDMDataNum(),
+             mac_sched_.Params().ModOrderBits(Direction::kDownlink),
+             kDownlinkHardDemod);
 
   if (kDownlinkHardDemod && (kPrintPhyStats || kEnableCsvLog) &&
       (dl_symbol_id >= config_.Frame().ClientDlPilotSymbols())) {
     phy_stats_.UpdateDecodedBits(
         ant_id, total_dl_symbol_id, frame_slot,
-        config_.GetOFDMDataNum() * config_.ModOrderBits(Direction::kDownlink));
+        config_.GetOFDMDataNum() *
+            mac_sched_.Params().ModOrderBits(Direction::kDownlink));
     phy_stats_.IncrementDecodedBlocks(ant_id, total_dl_symbol_id, frame_slot);
     int8_t* tx_bytes = config_.GetModBitsBuf(
-        config_.DlModBits(), Direction::kDownlink, 0, dl_symbol_id,
+        config_.DlModBits(), Direction::kDownlink, 0, dl_data_symbol_id,
         kDebugDownlink ? 0 : ant_id, base_sc_id);
     size_t block_error(0);
     for (size_t i = 0; i < config_.GetOFDMDataNum(); i++) {
@@ -468,6 +444,13 @@ void UeWorker::DoDemul(size_t tag) {
     phy_stats_.UpdateBlockErrors(ant_id, total_dl_symbol_id, frame_slot,
                                  block_error);
   }
+  if (kPrintLLRData) {
+    AGORA_LOG_INFO("LLR data, symbol_offset: %zu\n", offset);
+    for (size_t i = 0; i < config_.GetOFDMDataNum(); i++) {
+      AGORA_LOG_INFO("%x ", (uint8_t) * (demod_ptr + i));
+    }
+    AGORA_LOG_INFO("\n");
+  }
 
   if ((kDebugPrintPerTaskDone == true) || (kDebugPrintDemul == true)) {
     size_t dem_duration_stat = GetTime::Rdtsc() - start_tsc;
@@ -476,13 +459,6 @@ void UeWorker::DoDemul(size_t tag) {
         "%2.4f ms\n",
         tid_, frame_id, symbol_id, ant_id,
         GetTime::CyclesToMs(dem_duration_stat, GetTime::MeasureRdtscFreq()));
-  }
-  if (kPrintLLRData) {
-    AGORA_LOG_INFO("LLR data, symbol_offset: %zu\n", offset);
-    for (size_t i = 0; i < config_.GetOFDMDataNum(); i++) {
-      AGORA_LOG_INFO("%x ", (uint8_t) * (demod_ptr + i));
-    }
-    AGORA_LOG_INFO("\n");
   }
 
   RtAssert(
@@ -494,13 +470,14 @@ void UeWorker::DoDecodeUe(DoDecodeClient* decoder, size_t tag) {
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ant_id_;
-  const LDPCconfig& ldpc_config = config_.LdpcConfig(Direction::kDownlink);
-
+  const LDPCconfig& ldpc_config =
+      mac_sched_.Params().LdpcConfig(Direction::kDownlink);
   for (size_t cb_id = 0; cb_id < ldpc_config.NumBlocksInSymbol(); cb_id++) {
     // For now, call for each cb
     if (kDebugPrintDecode) {
       AGORA_LOG_INFO(
-          "Decoding [Frame %zu, Symbol %zu, User %zu, Code Block %zu : %zu]\n",
+          "Decoding [Frame %zu, Symbol %zu, User %zu, Code Block %zu : "
+          "%zu]\n",
           frame_id, symbol_id, ant_id, cb_id,
           ldpc_config.NumBlocksInSymbol() - 1);
     }
@@ -525,7 +502,8 @@ void UeWorker::DoEncodeUe(DoEncode* encoder, size_t tag) {
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ue_id_;
-  const LDPCconfig& ldpc_config = config_.LdpcConfig(Direction::kUplink);
+  const LDPCconfig& ldpc_config =
+      mac_sched_.Params().LdpcConfig(Direction::kUplink);
 
   // For now, call for each cb
   for (size_t cb_id = 0; cb_id < ldpc_config.NumBlocksInSymbol(); cb_id++) {
@@ -535,6 +513,7 @@ void UeWorker::DoEncodeUe(DoEncode* encoder, size_t tag) {
                             cb_id + (ant_id * ldpc_config.NumBlocksInSymbol()))
             .tag_);
   }
+
   // Post the completion event (symbol)
   const size_t completion_tag =
       gen_tag_t::FrmSymUe(frame_id, symbol_id, ant_id).tag_;
@@ -545,41 +524,43 @@ void UeWorker::DoEncodeUe(DoEncode* encoder, size_t tag) {
 
 // This functions accepts non pilot - UL symbols
 void UeWorker::DoModul(size_t tag) {
+  size_t start_tsc = GetTime::Rdtsc();
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ue_id_;
-
   if (kDebugPrintInTask || kDebugPrintModul) {
     AGORA_LOG_INFO("UeWorker[%zu]: Modul  (frame %zu, symbol %zu, ant %zu)\n",
                    tid_, frame_id, symbol_id, ant_id);
   }
-  size_t start_tsc = GetTime::Rdtsc();
 
-  const size_t ul_symbol_idx = config_.Frame().GetULSymbolIdx(symbol_id);
+  const size_t ul_data_symbol_idx = config_.Frame().GetULSymbolIdx(symbol_id) -
+                                    config_.Frame().ClientUlPilotSymbols();
   const size_t total_ul_data_symbol_id =
-      config_.GetTotalDataSymbolIdxUl(frame_id, ul_symbol_idx);
+      config_.GetTotalDataSymbolIdxUl(frame_id, ul_data_symbol_idx);
 
   complex_float* modul_buf =
       &modul_buffer_[total_ul_data_symbol_id][ant_id * config_.OfdmDataNum()];
 
-  auto* ul_bits = config_.GetModBitsBuf(encoded_buffer_, Direction::kUplink,
-                                        frame_id, ul_symbol_idx, ant_id, 0);
-
+  auto* ul_bits = config_.GetModBitsBuf(
+      kDebugBypassEncode ? config_.UlModBits() : encoded_buffer_,
+      Direction::kUplink, kDebugBypassEncode ? 0 : frame_id, ul_data_symbol_idx,
+      ant_id, 0);
   if (kDebugPrintModul) {
     AGORA_LOG_INFO(
         "UeWorker[%zu]: Modul  (frame %zu, symbol %zu, ant %zu) - getting "
         "from location (%zu %zu %zu) %zu and putting into location (%zu, "
         "%zu) %zu\n\n",
-        tid_, frame_id, symbol_id, ant_id, frame_id,
-        ul_symbol_idx - config_.Frame().ClientUlPilotSymbols(), ant_id,
+        tid_, frame_id, symbol_id, ant_id, frame_id, ul_data_symbol_idx, ant_id,
         (size_t)ul_bits, total_ul_data_symbol_id,
         ant_id * config_.OfdmDataNum(), (size_t)modul_buf);
   }
 
   // TODO place directly into the correct location of the fft buffer
+  Table<complex_float> mod_table =
+      mac_sched_.Params().ModTable(Direction::kUplink);
   for (size_t sc = 0; sc < config_.OfdmDataNum(); sc++) {
-    modul_buf[sc] = ModSingleUint8(static_cast<uint8_t>(ul_bits[sc]),
-                                   config_.ModTable(Direction::kUplink));
+    modul_buf[sc] =
+        ModSingleUint8(static_cast<uint8_t>(ul_bits[sc]), mod_table);
   }
 
   if ((kDebugPrintPerTaskDone == true) || (kDebugPrintModul == true)) {
@@ -599,27 +580,33 @@ void UeWorker::DoIfftUe(DoIFFTClient* iffter, size_t tag) {
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ue_id_;
-
-  // TODO Remove this copy
-  {
-    complex_float const* source_data = nullptr;
-    const size_t ul_symbol_idx = config_.Frame().GetULSymbolIdx(symbol_id);
-    size_t total_ul_symbol_id =
-        config_.GetTotalDataSymbolIdxUl(frame_id, ul_symbol_idx);
-    if (ul_symbol_idx < config_.Frame().ClientUlPilotSymbols()) {
-      source_data = config_.UeSpecificPilot()[ant_id];
-    } else {
-      source_data =
-          &modul_buffer_[total_ul_symbol_id][ant_id * config_.OfdmDataNum()];
+  if (mac_sched_.IsUeScheduled(frame_id, 0u, ant_id)) {
+    // TODO Remove this copy
+    {
+      complex_float const* source_data = nullptr;
+      const size_t ul_symbol_idx = config_.Frame().GetULSymbolIdx(symbol_id);
+      const size_t ul_data_symbol_idx =
+          config_.Frame().GetULSymbolIdx(symbol_id) -
+          config_.Frame().ClientUlPilotSymbols();
+      const size_t total_ul_symbol_id =
+          config_.GetTotalSymbolIdxUl(frame_id, ul_symbol_idx);
+      const size_t total_ul_data_symbol_id =
+          config_.GetTotalDataSymbolIdxUl(frame_id, ul_data_symbol_idx);
+      if (ul_symbol_idx < config_.Frame().ClientUlPilotSymbols()) {
+        source_data = config_.UeSpecificPilot()[ant_id];
+      } else {
+        source_data = &modul_buffer_[total_ul_data_symbol_id]
+                                    [ant_id * config_.OfdmDataNum()];
+      }
+      const size_t buff_offset =
+          (total_ul_symbol_id * config_.UeAntNum()) + ant_id;
+      complex_float* dest_loc =
+          ifft_buffer_[buff_offset] + (config_.OfdmDataStart());
+      std::memcpy(dest_loc, source_data,
+                  sizeof(complex_float) * config_.OfdmDataNum());
     }
-    const size_t buff_offset =
-        (total_ul_symbol_id * config_.UeAntNum()) + ant_id;
-    complex_float* dest_loc =
-        ifft_buffer_[buff_offset] + (config_.OfdmDataStart());
-    std::memcpy(dest_loc, source_data,
-                sizeof(complex_float) * config_.OfdmDataNum());
+    iffter->Launch(gen_tag_t::FrmSymAnt(frame_id, symbol_id, ant_id).tag_);
   }
-  iffter->Launch(gen_tag_t::FrmSymAnt(frame_id, symbol_id, ant_id).tag_);
 
   // Post the completion event (symbol)
   size_t completion_tag = gen_tag_t::FrmSymUe(frame_id, symbol_id, ant_id).tag_;
@@ -629,83 +616,91 @@ void UeWorker::DoIfftUe(DoIFFTClient* iffter, size_t tag) {
 }
 
 void UeWorker::DoIfft(size_t tag) {
+  size_t start_tsc = GetTime::Rdtsc();
   const size_t frame_id = gen_tag_t(tag).frame_id_;
   const size_t symbol_id = gen_tag_t(tag).symbol_id_;
   const size_t ant_id = gen_tag_t(tag).ue_id_;
-  const size_t frame_slot = (frame_id % kFrameWnd);
+  const bool bypass_ifft = config_.FreqDomainChannel();
 
-  if (kDebugPrintInTask) {
-    AGORA_LOG_INFO("User Task[%zu]: iFFT   (frame %zu, symbol %zu, user %zu)\n",
-                   tid_, frame_id, symbol_id, ant_id);
-  }
-  size_t start_tsc = GetTime::Rdtsc();
-
-  const size_t ul_symbol_perframe = config_.Frame().NumULSyms();
   const size_t ul_symbol_idx = config_.Frame().GetULSymbolIdx(symbol_id);
   const size_t total_ul_symbol_id =
-      frame_slot * ul_symbol_perframe + ul_symbol_idx;
+      config_.GetTotalSymbolIdxUl(frame_id, ul_symbol_idx);
   const size_t buff_offset = (total_ul_symbol_id * config_.UeAntNum()) + ant_id;
-  complex_float* ifft_buff = ifft_buffer_[buff_offset];
-
-  std::memset(ifft_buff, 0u, sizeof(complex_float) * config_.OfdmDataStart());
-  if (ul_symbol_idx < config_.Frame().ClientUlPilotSymbols()) {
-    std::memcpy(ifft_buff + config_.OfdmDataStart(),
-                config_.UeSpecificPilot()[ant_id],
-                config_.OfdmDataNum() * sizeof(complex_float));
-  } else {
-    complex_float* modul_buff =
-        &modul_buffer_[total_ul_symbol_id][ant_id * config_.OfdmDataNum()];
-    std::memcpy(ifft_buff + config_.OfdmDataStart(), modul_buff,
-                config_.OfdmDataNum() * sizeof(complex_float));
-    if (kDebugTxData) {
-      const complex_float* data_truth =
-          &config_.UlIqF()[ul_symbol_idx][ant_id * config_.OfdmDataNum()];
-      if (memcmp(data_truth, modul_buff,
-                 config_.OfdmDataNum() * sizeof(complex_float)) == 0) {
-        AGORA_LOG_INFO(
-            "Uplink iFFT: (frame %zu, symbol %zu, user %zu) Data SC values "
-            "matched UlIqF all %zu sc\n",
-            frame_id, symbol_id, ant_id, config_.OfdmDataNum());
-      } else {
-        size_t cnt_sc_mismatch = 0;
-        for (size_t i = 0; i < config_.OfdmDataNum(); i++) {
-          if (data_truth[i].re != modul_buff[i].re ||
-              data_truth[i].im != modul_buff[i].im) {
-            cnt_sc_mismatch++;
-          }
-        }
-        AGORA_LOG_INFO(
-            "Uplink iFFT: (frame %zu, symbol %zu, user %zu) Data SC values "
-            "mismatched UlIqF %zu of %zu sc\n",
-            frame_id, symbol_id, ant_id, cnt_sc_mismatch,
-            config_.OfdmDataNum());
-      }
-    }
-  }
-  std::memset(ifft_buff + config_.OfdmDataStop(), 0,
-              sizeof(complex_float) * config_.OfdmDataStart());
-
-  std::vector<complex_float> temp_fft_buf(config_.OfdmCaNum());
-  auto* temp_buff = reinterpret_cast<complex_float*>(temp_fft_buf.data());
-  CommsLib::FFTShift(ifft_buff, temp_buff, config_.OfdmCaNum());
-  CommsLib::IFFT(ifft_buff, config_.OfdmCaNum(), false);
-
   const size_t tx_offset = buff_offset * config_.PacketLength();
   char* cur_tx_buffer = &tx_buffer_[tx_offset];
-
-  if (kDebugTxMemory) {
-    AGORA_LOG_INFO(
-        "Tx data for (Frame %zu Symbol %zu Ant %zu) is located at tx offset "
-        "%zu:%zu at location %ld\n",
-        frame_id, symbol_id, ant_id, buff_offset, tx_offset,
-        (intptr_t)cur_tx_buffer);
-  }
-
   auto* pkt = reinterpret_cast<Packet*>(cur_tx_buffer);
   auto* tx_data_ptr = reinterpret_cast<std::complex<short>*>(pkt->data_);
-  CommsLib::Ifft2tx(ifft_buff, tx_data_ptr, config_.OfdmCaNum(),
-                    config_.OfdmTxZeroPrefix(), config_.CpLen(),
-                    config_.Scale());
+  if (mac_sched_.IsUeScheduled(frame_id, 0u, ant_id)) {
+    if (kDebugPrintInTask) {
+      AGORA_LOG_INFO(
+          "User Task[%zu]: iFFT   (frame %zu, symbol %zu, user %zu)\n", tid_,
+          frame_id, symbol_id, ant_id);
+    }
+
+    if (ul_symbol_idx < config_.Frame().ClientUlPilotSymbols()) {
+      std::memcpy(tx_data_ptr, config_.UeSpecificPilotT()[ant_id],
+                  config_.SampsPerSymbol() * sizeof(std::complex<int16_t>));
+    } else {
+      const size_t ul_data_symbol_idx =
+          ul_symbol_idx - config_.Frame().ClientUlPilotSymbols();
+      const size_t total_ul_data_symbol_id =
+          config_.GetTotalDataSymbolIdxUl(frame_id, ul_data_symbol_idx);
+      complex_float* modul_buff =
+          &modul_buffer_[total_ul_data_symbol_id]
+                        [ant_id * config_.OfdmDataNum()];
+      complex_float* ifft_buff = ifft_buffer_[buff_offset];
+      std::memset(ifft_buff, 0u,
+                  sizeof(complex_float) * config_.OfdmDataStart());
+      std::memcpy(ifft_buff + config_.OfdmDataStart(), modul_buff,
+                  config_.OfdmDataNum() * sizeof(complex_float));
+      if (kDebugTxData) {
+        const complex_float* data_truth =
+            &config_
+                 .UlIqF()[ul_data_symbol_idx][ant_id * config_.OfdmDataNum()];
+        if (memcmp(data_truth, modul_buff,
+                   config_.OfdmDataNum() * sizeof(complex_float)) == 0) {
+          AGORA_LOG_INFO(
+              "Uplink iFFT: (frame %zu, symbol %zu, user %zu) Data SC values "
+              "matched UlIqF all %zu sc\n",
+              frame_id, symbol_id, ant_id, config_.OfdmDataNum());
+        } else {
+          size_t cnt_sc_mismatch = 0;
+          for (size_t i = 0; i < config_.OfdmDataNum(); i++) {
+            if (data_truth[i].re != modul_buff[i].re ||
+                data_truth[i].im != modul_buff[i].im) {
+              cnt_sc_mismatch++;
+            }
+          }
+          AGORA_LOG_INFO(
+              "Uplink iFFT: (frame %zu, symbol %zu, user %zu) Data SC values "
+              "mismatched UlIqF %zu of %zu sc\n",
+              frame_id, symbol_id, ant_id, cnt_sc_mismatch,
+              config_.OfdmDataNum());
+        }
+      }
+      std::memset(ifft_buff + config_.OfdmDataStop(), 0,
+                  sizeof(complex_float) * config_.OfdmDataStart());
+
+      if (bypass_ifft == false) {
+        CommsLib::FFTShift(ifft_buff, config_.OfdmCaNum());
+        CommsLib::IFFT(ifft_buff, config_.OfdmCaNum(), false);
+      }
+
+      if (kDebugTxMemory) {
+        AGORA_LOG_INFO(
+            "Tx data for (Frame %zu Symbol %zu Ant %zu) is located at tx "
+            "offset %zu:%zu at location %ld\n",
+            frame_id, symbol_id, ant_id, buff_offset, tx_offset,
+            (intptr_t)cur_tx_buffer);
+      }
+
+      CommsLib::Ifft2tx(ifft_buff, tx_data_ptr, config_.OfdmCaNum(),
+                        config_.OfdmTxZeroPrefix(), config_.CpLen(),
+                        config_.Scale());
+    }
+  } else {
+    std::memset(pkt->data_, 0, 2 * sizeof(short) * config_.SampsPerSymbol());
+  }
 
   if (kDebugPrintPerTaskDone) {
     size_t ifft_duration_stat = GetTime::Rdtsc() - start_tsc;
