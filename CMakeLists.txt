@@ -425,7 +425,9 @@ set(COMMON_SOURCES
   src/common/loggers/mat_logger.cc
   src/encoder/cyclic_shift.cc
   src/encoder/encoder.cc
-  src/encoder/iobuffer.cc)
+  src/encoder/iobuffer.cc
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
 
 set(SHARED_TXRX_SOURCES
