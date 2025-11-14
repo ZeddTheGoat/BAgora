@@ -60,6 +60,11 @@ struct Topology {
 std::map<DecoderKey, Topology> g_decoder_cache;
 std::mutex g_decoder_mutex;
 
+struct Term {
+  double coefficient;
+  std::vector<uint32_t> vars;
+};
+
 double SafeDivide(double numerator, double denominator) {
   constexpr double kEps = 1e-12;
   double denom = denominator;
@@ -193,6 +198,33 @@ SbDecodeResult SimulatedBifurcationDecode(const LDPCconfig& config,
 
   std::vector<double> fields(total_vars, 0.0);
 
+  std::vector<Term> terms;
+  terms.reserve(total_vars + num_checks);
+  std::vector<std::vector<size_t>> var_to_terms(total_vars);
+
+  for (size_t v = 0; v < total_vars; v++) {
+    Term t;
+    t.coefficient = 0.0;
+    t.vars.push_back(static_cast<uint32_t>(v));
+    terms.push_back(std::move(t));
+    const size_t term_index = terms.size() - 1;
+    var_to_terms[v].push_back(term_index);
+  }
+
+  for (size_t check = 0; check < num_checks; check++) {
+    Term t;
+    t.coefficient = -kPenalty;
+    t.vars.reserve(topo.check_to_var[check].size());
+    for (uint32_t var_index : topo.check_to_var[check]) {
+      t.vars.push_back(var_index);
+    }
+    const size_t term_index = terms.size();
+    terms.push_back(std::move(t));
+    for (uint32_t var_index : topo.check_to_var[check]) {
+      var_to_terms[var_index].push_back(term_index);
+    }
+  }
+
   size_t llr_index = 0;
   for (size_t col = 0; col < topo.total_cols; col++) {
     const bool punctured = (col < kNumPuncturedCols);
@@ -204,19 +236,13 @@ SbDecodeResult SimulatedBifurcationDecode(const LDPCconfig& config,
         llr_index++;
       }
       fields[var_index] = llr;
+      terms[var_index].coefficient = -llr;
     }
-  }
-
-  if (llr_index != num_channel_llrs) {
-    result.success = false;
-    result.iterations = 0;
-    result.unsatisfied_checks = num_checks;
-    return result;
   }
 
   std::vector<double> best_spins(total_vars, 1.0);
   double best_energy = std::numeric_limits<double>::infinity();
-  std::vector<double> check_products(num_checks, 0.0);
+  std::vector<double> term_products(terms.size(), 0.0);
   std::vector<double> gradient(total_vars, 0.0);
 
   std::array<uint64_t, kSbReads> seeds{};
@@ -259,17 +285,17 @@ SbDecodeResult SimulatedBifurcationDecode(const LDPCconfig& config,
     bool satisfied_this_read = false;
     for (size_t step = 0; step < sb_steps; step++) {
       steps_this_read++;
-      double energy = 0.0;
-      for (size_t v = 0; v < total_vars; v++) {
-        energy -= fields[v] * spins[v];
-      }
-      for (size_t check = 0; check < num_checks; check++) {
+      for (size_t t = 0; t < terms.size(); t++) {
         double product = 1.0;
-        for (uint32_t var_index : topo.check_to_var[check]) {
+        for (uint32_t var_index : terms[t].vars) {
           product *= spins[var_index];
         }
-        check_products[check] = product;
-        energy += -kPenalty * product;
+        term_products[t] = product;
+      }
+
+      double energy = 0.0;
+      for (size_t t = 0; t < terms.size(); t++) {
+        energy += terms[t].coefficient * term_products[t];
       }
       if (energy < read_best_energy) {
         read_best_energy = energy;
@@ -290,16 +316,20 @@ SbDecodeResult SimulatedBifurcationDecode(const LDPCconfig& config,
         }
       }
 
+      std::fill(gradient.begin(), gradient.end(), 0.0);
       for (size_t v = 0; v < total_vars; v++) {
-        gradient[v] = -fields[v];
-      }
-      for (size_t check = 0; check < num_checks; check++) {
-        const double product = check_products[check];
-        const double coeff = -kPenalty;
-        for (uint32_t var_index : topo.check_to_var[check]) {
-          double exclude = SafeDivide(product, spins[var_index]);
-          gradient[var_index] += coeff * exclude;
+        double acc = 0.0;
+        for (size_t term_index : var_to_terms[v]) {
+          const Term& term = terms[term_index];
+          const double product = term_products[term_index];
+          if (term.vars.size() == 1) {
+            acc += term.coefficient;
+          } else {
+            double exclude = SafeDivide(product, spins[v]);
+            acc += term.coefficient * exclude;
+          }
         }
+        gradient[v] = acc;
       }
 
       for (size_t v = 0; v < total_vars; v++) {

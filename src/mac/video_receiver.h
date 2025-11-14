@@ -27,7 +27,7 @@ class VideoReceiver : public MacDataReceiver {
   static constexpr size_t kVideoStreamLocalRxBufSize =
       kVideoStreamMaxRxSize * 10;
 
-  explicit VideoReceiver(uint16_t port);
+  explicit VideoReceiver(std::string addr, uint16_t port);
   ~VideoReceiver() override = default;
 
   size_t Load(unsigned char *destination, size_t requested_bytes) final;
@@ -37,8 +37,8 @@ class VideoReceiver : public MacDataReceiver {
   std::array<std::byte, VideoReceiver::kVideoStreamLocalRxBufSize>
       local_rx_buffer_;
 
-  size_t data_available_;
-  size_t data_start_offset_;
+  size_t data_available_{0};
+  size_t data_start_offset_{0};
 };
 
 #endif  // VIDEO_RECEIVER_H_

@@ -12,6 +12,7 @@
 
 #include "config.h"
 #include "doer.h"
+#include "mac_scheduler.h"
 #include "memory_manage.h"
 #include "message.h"
 #include "scrambler.h"
@@ -20,18 +21,18 @@
 class DoEncode : public Doer {
  public:
   DoEncode(Config* in_config, int in_tid, Direction dir,
-           Table<int8_t>& in_raw_data_buffer, size_t in_buffer_rollover,
-           Table<int8_t>& in_mod_bits_buffer, Stats* in_stats_manager);
+           Table<int8_t>& in_raw_data_buffer, Table<int8_t>& in_mod_bits_buffer,
+           MacScheduler* mac_sched, Stats* in_stats_manager);
   ~DoEncode() override;
 
   EventData Launch(size_t tag) override;
 
  private:
   Direction dir_;
+  size_t num_data_syms_;
 
   // References to buffers allocated pre-construction
   Table<int8_t>& raw_data_buffer_;
-  size_t raw_buffer_rollover_;
   Table<int8_t>& mod_bits_buffer_;
 
   // Intermediate buffer to hold LDPC encoding parity
@@ -42,7 +43,9 @@ class DoEncode : public Doer {
 
   // Intermediate buffer to hold pre/post scrambled data
   int8_t* scrambler_buffer_;
+  size_t scrambler_buffer_bytes_;
 
+  MacScheduler* mac_sched_;
   DurationStat* duration_stat_;
   std::unique_ptr<AgoraScrambler::Scrambler> scrambler_;
 };

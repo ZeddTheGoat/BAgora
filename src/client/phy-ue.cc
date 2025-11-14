@@ -19,7 +19,6 @@
 #include "utils_ldpc.h"
 
 /* Print debug work */
-static constexpr bool kDebugPrintPacketsFromMac = false;
 static constexpr bool kDebugPrintPacketsToMac = false;
 static constexpr size_t kDefaultQueueSize = 36;
 
@@ -42,18 +41,20 @@ static const std::vector<Agora_recorder::RecorderWorker::RecorderWorkerTypes>
 #endif
 
 PhyUe::PhyUe(Config* config)
-    : stats_(std::make_unique<Stats>(config)),
-      phy_stats_(std::make_unique<PhyStats>(config, Direction::kDownlink)),
-      demod_buffer_(kFrameWnd, config->Frame().NumDLSyms(), config->UeAntNum(),
+    : mac_sched_(std::make_unique<MacScheduler>(config)),
+      stats_(std::make_unique<Stats>(config)),
+      demod_buffer_(kFrameWnd, config->Frame().NumDlDataSyms(),
+                    config->UeAntNum(),
                     kMaxModType * Roundup<64>(config->GetOFDMDataNum())),
       decoded_buffer_(
-          kFrameWnd, config->Frame().NumDLSyms(), config->UeAntNum(),
-          config->LdpcConfig(Direction::kDownlink).NumBlocksInSymbol() *
-              Roundup<64>(config->NumBytesPerCb(Direction::kDownlink))) {
+          kFrameWnd, config->Frame().NumDlDataSyms(), config->UeAntNum(),
+          config->MacParams().MaxPacketBytes(Direction::kDownlink)) {
   srand(time(nullptr));
   // TODO take into account the UeAntOffset to allow for multiple PhyUe
   // instances
   this->config_ = config;
+  phy_stats_ = std::make_unique<PhyStats>(config, mac_sched_.get(),
+                                          Direction::kDownlink);
   InitializeVarsFromCfg();
 
   for (size_t i = config_->OfdmDataStart();
@@ -88,8 +89,6 @@ PhyUe::PhyUe(Config* config)
   for (size_t i = 0; i < rx_thread_num_; i++) {
     rx_ptoks_ptr_[i] = new moodycamel::ProducerToken(complete_queue_);
     tx_ptoks_ptr_[i] = new moodycamel::ProducerToken(tx_queue_);
-    mac_rx_ptoks_ptr_[i] = new moodycamel::ProducerToken(complete_queue_);
-    mac_tx_ptoks_ptr_[i] = new moodycamel::ProducerToken(to_mac_queue_);
   }
 
   work_producer_token_ =
@@ -116,23 +115,22 @@ PhyUe::PhyUe(Config* config)
   }
 
   size_t core_offset_worker = config_->UeCoreOffset() + 1 + rx_thread_num_;
-  if (kEnableMac == true) {
-    mac_thread_ = std::make_unique<MacThreadClient>(
-        config_, core_offset_worker, decoded_buffer_, &ul_bits_buffer_,
-        &ul_bits_buffer_status_, &to_mac_queue_, &complete_queue_);
+  mac_thread_ = std::make_unique<MacThreadClient>(
+      config_, core_offset_worker, decoded_buffer_, &ul_bits_buffer_,
+      &ul_bits_buffer_status_, &to_mac_queue_, &complete_queue_,
+      mac_sched_.get(), phy_stats_.get());
 
-    core_offset_worker++;
-    mac_std_thread_ =
-        std::thread(&MacThreadClient::RunEventLoop, mac_thread_.get());
-  }
+  core_offset_worker++;
+  mac_std_thread_ =
+      std::thread(&MacThreadClient::RunEventLoop, mac_thread_.get());
 
   for (size_t i = 0; i < config_->UeWorkerThreadNum(); i++) {
     auto new_worker = std::make_unique<UeWorker>(
-        i, *config_, *stats_, *phy_stats_, complete_queue_, work_queue_,
-        *work_producer_token_.get(), ul_bits_buffer_, ul_syms_buffer_,
-        modul_buffer_, ifft_buffer_, tx_buffer_, rx_buffer_, csi_buffer_,
-        equal_buffer_, non_null_sc_ind_, fft_buffer_, demod_buffer_,
-        decoded_buffer_, ue_pilot_vec_);
+        i, *config_, *mac_sched_, *stats_, *phy_stats_, complete_queue_,
+        work_queue_, *work_producer_token_.get(), ul_bits_buffer_,
+        encoded_buffer_, modul_buffer_, ifft_buffer_, tx_buffer_, rx_buffer_,
+        csi_buffer_, equal_buffer_, non_null_sc_ind_, fft_buffer_,
+        demod_buffer_, decoded_buffer_, ue_pilot_vec_);
 
     new_worker->Start(core_offset_worker);
     workers_.push_back(std::move(new_worker));
@@ -201,15 +199,11 @@ PhyUe::~PhyUe() {
   }
   recorders_.clear();
 
-  if (kEnableMac == true) {
-    mac_std_thread_.join();
-  }
+  mac_std_thread_.join();
 
   for (size_t i = 0; i < rx_thread_num_; i++) {
     delete rx_ptoks_ptr_[i];
     delete tx_ptoks_ptr_[i];
-    delete mac_rx_ptoks_ptr_[i];
-    delete mac_tx_ptoks_ptr_[i];
   }
 
   FreeUplinkBuffers();
@@ -391,9 +385,13 @@ void PhyUe::Start() {
                                                  frame_id, frame_id - 1),
                   rx_counters_.num_pkts_.at(prev_frame_slot));
             }
+            if (config_->AdaptUes()) {
+              // Update MCS parameters for this frame (should be done once per frame)
+              mac_sched_->UpdateMcsParams(frame_id);
+            }
           }
 
-          if (config_->IsDlPilot(frame_id, symbol_id)) {
+          if (config_->Frame().IsDlPilot(symbol_id)) {
             rx_counters_.num_pilot_pkts_.at(frame_slot)++;
             if (rx_counters_.num_pilot_pkts_.at(frame_slot) ==
                 rx_counters_.num_pilot_pkts_per_frame_) {
@@ -416,38 +414,47 @@ void PhyUe::Start() {
             // (Only when in Downlink Only mode, otherwise the pilots
             // will be transmitted with the uplink data)
             if (ul_symbol_perframe_ == 0) {
-              const EventData do_tx_pilot_task(
+              const EventData tx_pilot_task(
                   EventType::kPacketPilotTX,
                   gen_tag_t::FrmUe(frame_id, ant_id).tag_);
-              ScheduleTask(do_tx_pilot_task, &tx_queue_,
+              ScheduleTask(tx_pilot_task, &tx_queue_,
                            *tx_ptoks_ptr_[ru_->AntNumToWorkerId(ant_id)]);
             } else {
               // Schedule the Uplink tasks
               for (size_t symbol_idx = 0;
-                   symbol_idx < config_->Frame().NumULSyms(); symbol_idx++) {
-                if (symbol_idx < config_->Frame().ClientUlPilotSymbols()) {
-                  EventData do_ifft_task(
+                   symbol_idx < config_->Frame().ClientUlPilotSymbols();
+                   symbol_idx++) {
+                EventData ifft_task(
+                    EventType::kIFFT,
+                    gen_tag_t::FrmSymUe(
+                        frame_id, config_->Frame().GetULSymbol(symbol_idx),
+                        ant_id)
+                        .tag_);
+                ScheduleWork(ifft_task);
+              }  // For all UL Symbols
+              if (mac_sched_->IsUeScheduled(frame_id, 0u, ant_id)) {
+                // request packet from MAC
+                EventData req_mac_task(EventType::kPacketFromMac,
+                                       gen_tag_t::FrmUe(frame_id, ant_id).tag_);
+                ScheduleTask(req_mac_task, &to_mac_queue_, ptok_mac);
+              } else {
+                for (size_t symbol_idx =
+                         config_->Frame().ClientUlPilotSymbols();
+                     symbol_idx < config_->Frame().NumULSyms(); symbol_idx++) {
+                  EventData ifft_task(
                       EventType::kIFFT,
                       gen_tag_t::FrmSymUe(
                           frame_id, config_->Frame().GetULSymbol(symbol_idx),
                           ant_id)
                           .tag_);
-                  ScheduleWork(do_ifft_task);
-                } else {
-                  EventData do_encode_task(
-                      EventType::kEncode,
-                      gen_tag_t::FrmSymUe(
-                          frame_id, config_->Frame().GetULSymbol(symbol_idx),
-                          ant_id)
-                          .tag_);
-                  ScheduleWork(do_encode_task);
+                  ScheduleWork(ifft_task);
                 }
-              }  // For all UL Symbols
+              }
             }
           }
-
-          SymbolType symbol_type = config_->GetSymbolType(symbol_id);
-          if (symbol_type == SymbolType::kDL) {
+          SymbolType symbol_type = config_->Frame().GetSymbolType(symbol_id);
+          if (symbol_type == SymbolType::kDL &&
+              mac_sched_->IsUeScheduled(frame_id, 0u, ant_id)) {
             // Defer downlink processing (all pilot symbols must be fft'd
             // first)
             ReceiveDownlinkSymbol(pkt, event.tags_[0]);
@@ -460,21 +467,23 @@ void PhyUe::Start() {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
           const size_t ant_id = gen_tag_t(event.tags_[0]).ant_id_;
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
 
           PrintPerTaskDone(PrintType::kFFTPilots, frame_id, symbol_id, ant_id);
-          const bool tasks_complete =
-              fft_dlpilot_counters_.CompleteTask(frame_id, symbol_id);
+          const bool tasks_complete = fft_dlpilot_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem);
           if (tasks_complete) {
             PrintPerSymbolDone(PrintType::kFFTPilots, frame_id, symbol_id);
             const bool pilot_fft_complete =
                 fft_dlpilot_counters_.CompleteSymbol(frame_id);
             if (pilot_fft_complete) {
+              auto ue_map = mac_sched_->ScheduledUeMap(frame_id, 0u);
               if (kPrintPhyStats) {
-                this->phy_stats_->PrintDlSnrStats(frame_id);
+                this->phy_stats_->PrintDlSnrStats(frame_id, ue_list);
               }
               this->phy_stats_->RecordDlCsi(frame_id, config_->LogScNum(),
-                                            csi_buffer_);
-              this->phy_stats_->RecordDlPilotSnr(frame_id);
+                                            csi_buffer_, ue_list);
+              this->phy_stats_->RecordDlPilotSnr(frame_id, ue_map);
               this->stats_->MasterSetTsc(TsType::kFFTPilotsDone, frame_id);
               PrintPerFrameDone(PrintType::kFFTPilots, frame_id);
               ScheduleDefferedDownlinkSymbols(frame_id);
@@ -486,14 +495,15 @@ void PhyUe::Start() {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
           const size_t ant_id = gen_tag_t(event.tags_[0]).ant_id_;
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
 
           // Schedule the Demul
           EventData do_demul_task(EventType::kDemul, event.tags_[0]);
           ScheduleWork(do_demul_task);
 
           PrintPerTaskDone(PrintType::kFFTData, frame_id, symbol_id, ant_id);
-          const bool tasks_complete =
-              fft_dldata_counters_.CompleteTask(frame_id, symbol_id);
+          const bool tasks_complete = fft_dldata_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem);
           if (tasks_complete == true) {
             PrintPerSymbolDone(PrintType::kFFTData, frame_id, symbol_id);
             bool fft_complete = fft_dldata_counters_.CompleteSymbol(frame_id);
@@ -511,6 +521,7 @@ void PhyUe::Start() {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
           const size_t ant_id = gen_tag_t(event.tags_[0]).ant_id_;
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
 
           if (kDownlinkHardDemod == false) {
             EventData do_decode_task(EventType::kDecode, event.tags_[0]);
@@ -519,7 +530,7 @@ void PhyUe::Start() {
 
           PrintPerTaskDone(PrintType::kDemul, frame_id, symbol_id, ant_id);
           const bool symbol_complete =
-              demul_counters_.CompleteTask(frame_id, symbol_id);
+              demul_counters_.CompleteTask(frame_id, symbol_id, ue_list.n_elem);
           if (symbol_complete == true) {
             PrintPerSymbolDone(PrintType::kDemul, frame_id, symbol_id);
             max_equaled_frame_ = frame_id;
@@ -529,13 +540,17 @@ void PhyUe::Start() {
               PrintPerFrameDone(PrintType::kDemul, frame_id);
               demul_counters_.Reset(frame_id);
 
-              this->phy_stats_->RecordEvm(frame_id, config_->LogScNum());
-              this->phy_stats_->RecordEvmSnr(frame_id);
+              auto ue_map = mac_sched_->ScheduledUeMap(frame_id, 0u);
+              auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+
+              this->phy_stats_->RecordEvm(frame_id, config_->LogScNum(),
+                                          ue_map);
+              this->phy_stats_->RecordEvmSnr(frame_id, ue_map);
               this->phy_stats_->ClearEvmBuffer(frame_id);
 
               if (kDownlinkHardDemod) {
-                this->phy_stats_->RecordBer(frame_id);
-                this->phy_stats_->RecordSer(frame_id);
+                this->phy_stats_->RecordBer(frame_id, ue_map);
+                this->phy_stats_->RecordSer(frame_id, ue_map);
                 const bool finished =
                     FrameComplete(frame_id, FrameTasksFlags::kDownlinkComplete);
                 if (finished == true) {
@@ -555,22 +570,16 @@ void PhyUe::Start() {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
           const size_t ant_id = gen_tag_t(event.tags_[0]).ant_id_;
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
 
           PrintPerTaskDone(PrintType::kDecode, frame_id, symbol_id, ant_id);
 
-          const bool symbol_complete =
-              decode_counters_.CompleteTask(frame_id, symbol_id);
+          ScheduleTask(EventData(EventType::kPacketToMac, event.tags_[0]),
+                       &to_mac_queue_, ptok_mac);
+          const bool symbol_complete = decode_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem);
+
           if (symbol_complete == true) {
-            if (kEnableMac) {
-              auto base_tag = gen_tag_t::FrmSymUe(frame_id, symbol_id, 0);
-
-              for (size_t i = 0; i < config_->UeAntNum(); i++) {
-                ScheduleTask(EventData(EventType::kPacketToMac, base_tag.tag_),
-                             &to_mac_queue_, ptok_mac);
-
-                base_tag.ue_id_++;
-              }
-            }
             PrintPerSymbolDone(PrintType::kDecode, frame_id, symbol_id);
 
             bool decode_complete = decode_counters_.CompleteSymbol(frame_id);
@@ -578,18 +587,9 @@ void PhyUe::Start() {
               this->stats_->MasterSetTsc(TsType::kDecodeDone, frame_id);
               PrintPerFrameDone(PrintType::kDecode, frame_id);
               decode_counters_.Reset(frame_id);
-              this->phy_stats_->RecordBer(frame_id);
-              this->phy_stats_->RecordSer(frame_id);
-              bool finished =
-                  FrameComplete(frame_id, FrameTasksFlags::kDownlinkComplete);
-              if (finished == true) {
-                if ((cur_frame_id + 1) >= config_->FramesToTest()) {
-                  config_->Running(false);
-                } else {
-                  FrameInit(frame_id);
-                  cur_frame_id = frame_id + 1;
-                }
-              }
+              auto ue_map = mac_sched_->ScheduledUeMap(frame_id, 0u);
+              this->phy_stats_->RecordBer(frame_id, ue_map);
+              this->phy_stats_->RecordSer(frame_id, ue_map);
             }
           }
         } break;
@@ -598,16 +598,19 @@ void PhyUe::Start() {
           const size_t frame_id = gen_tag_t(event.tags_[0]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0]).symbol_id_;
           const size_t dl_symbol_idx =
-              config_->Frame().GetDLSymbolIdx(symbol_id);
+              config_->Frame().GetDLSymbolIdx(symbol_id) -
+              config_->Frame().ClientDlPilotSymbols();
 
           if (kDebugPrintPacketsToMac) {
             AGORA_LOG_INFO(
-                "PhyUe: sent decoded packet for (frame %zu, symbol %zu:%zu) to "
+                "PhyUe: sent decoded packet for (frame %zu, symbol %zu:%zu) "
+                "to "
                 "MAC\n",
                 frame_id, symbol_id, dl_symbol_idx);
           }
-          const bool last_tomac_task =
-              tomac_counters_.CompleteTask(frame_id, dl_symbol_idx);
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+          const bool last_tomac_task = tomac_counters_.CompleteTask(
+              frame_id, dl_symbol_idx, ue_list.n_elem);
 
           if (last_tomac_task == true) {
             PrintPerSymbolDone(PrintType::kPacketToMac, frame_id, symbol_id);
@@ -620,7 +623,7 @@ void PhyUe::Start() {
               tomac_counters_.Reset(frame_id);
 
               const bool finished =
-                  FrameComplete(frame_id, FrameTasksFlags::kMacTxComplete);
+                  FrameComplete(frame_id, FrameTasksFlags::kDownlinkComplete);
               if (finished == true) {
                 if ((cur_frame_id + 1) >= config_->FramesToTest()) {
                   config_->Running(false);
@@ -635,56 +638,21 @@ void PhyUe::Start() {
 
         case EventType::kPacketFromMac: {
           // This is an entire frame (multiple mac packets)
+          const size_t frame_id = rx_mac_tag_t(event.tags_[0]).frame_id_;
           const size_t ue_id = rx_mac_tag_t(event.tags_[0]).tid_;
-          const size_t radio_buf_id = rx_mac_tag_t(event.tags_[0]).offset_;
-          RtAssert(radio_buf_id == (expected_frame_id_from_mac_ % kFrameWnd),
-                   "Radio buffer id does not match expected");
-
-          const auto* pkt = reinterpret_cast<const MacPacketPacked*>(
-              &ul_bits_buffer_[ue_id]
-                              [radio_buf_id * config_->MacBytesNumPerframe(
-                                                  Direction::kUplink)]);
-
-          AGORA_LOG_TRACE(
-              "PhyUe: frame %d symbol %d user %d @ offset %zu %zu @ location "
-              "%zu\n",
-              pkt->Frame(), pkt->Symbol(), pkt->Ue(), ue_id, radio_buf_id,
-              (size_t)pkt);
-          RtAssert(pkt->Frame() ==
-                       static_cast<uint16_t>(expected_frame_id_from_mac_),
-                   "PhyUe: Incorrect frame ID from MAC");
-          current_frame_user_num_ =
-              (current_frame_user_num_ + 1) % config_->UeAntNum();
-          if (current_frame_user_num_ == 0) {
-            expected_frame_id_from_mac_++;
+          // TODO: Consider code blocks per symbol
+          for (size_t i = config_->Frame().ClientUlPilotSymbols();
+               i < config_->Frame().NumULSyms(); i++) {
+            EventData do_encode_task(
+                EventType::kEncode,
+                gen_tag_t::FrmSymUe(frame_id, config_->Frame().GetULSymbol(i),
+                                    ue_id)
+                    .tag_);
+            ScheduleWork(do_encode_task);
           }
 #if defined(ENABLE_RB_IND)
           config_->UpdateModCfgs(pkt->rb_indicator_.mod_order_bits_);
 #endif
-          if (kDebugPrintPacketsFromMac) {
-#if defined(ENABLE_RB_IND)
-            AGORA_LOG_INFO(
-                "PhyUe: received packet for frame %u with modulation %zu\n",
-                pkt->frame_id_, pkt->rb_indicator_.mod_order_bits_);
-#endif
-            std::stringstream ss;
-
-            for (size_t ul_data_symbol = 0;
-                 ul_data_symbol < config_->Frame().NumUlDataSyms();
-                 ul_data_symbol++) {
-              ss << "PhyUe: kPacketFromMac, frame " << pkt->Frame()
-                 << ", symbol " << std::to_string(pkt->Symbol()) << " crc "
-                 << std::to_string(pkt->Crc()) << " bytes: ";
-              for (size_t i = 0; i < pkt->PayloadLength(); i++) {
-                ss << std::to_string((pkt->Data()[i])) << ", ";
-              }
-              ss << std::endl;
-              pkt = reinterpret_cast<const MacPacketPacked*>(
-                  reinterpret_cast<const uint8_t*>(pkt) +
-                  config_->MacPacketLength(Direction::kUplink));
-            }
-            AGORA_LOG_INFO("%s\n", ss.str().c_str());
-          }
         } break;
 
         case EventType::kEncode: {
@@ -698,8 +666,9 @@ void PhyUe::Start() {
           EventData do_modul_task(EventType::kModul, event.tags_[0]);
           ScheduleWork(do_modul_task);
 
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
           const bool symbol_complete =
-              encode_counter_.CompleteTask(frame_id, symbol_id);
+              encode_counter_.CompleteTask(frame_id, symbol_id, ue_list.n_elem);
           if (symbol_complete == true) {
             PrintPerSymbolDone(PrintType::kEncode, frame_id, symbol_id);
 
@@ -725,8 +694,9 @@ void PhyUe::Start() {
               gen_tag_t::FrmSymUe(frame_id, symbol_id, ue_ant).tag_);
           ScheduleWork(do_ifft_task);
 
-          const bool symbol_complete =
-              modulation_counters_.CompleteTask(frame_id, symbol_id);
+          auto ue_list = mac_sched_->ScheduledUeList(frame_id, 0u);
+          const bool symbol_complete = modulation_counters_.CompleteTask(
+              frame_id, symbol_id, ue_list.n_elem);
           if (symbol_complete) {
             PrintPerSymbolDone(PrintType::kModul, frame_id, symbol_id);
 
@@ -890,34 +860,29 @@ void PhyUe::InitializeVarsFromCfg() {
                     (ul_symbol_perframe_ * config_->UeAntNum() * kFrameWnd);
 
   rx_buffer_size_ = config_->DlPacketLength() *
-                    (dl_symbol_perframe_ + config_->Frame().NumBeaconSyms()) *
+                    (dl_symbol_perframe_ + config_->Frame().NumDlBcastSyms()) *
                     config_->UeAntNum() * kFrameWnd;
 }
 
 void PhyUe::InitializeUplinkBuffers() {
   // initialize ul data buffer
+  const size_t ul_data_syms_buffer_dim1 = ul_data_symbol_perframe_ * kFrameWnd;
   ul_bits_buffer_size_ =
-      kFrameWnd * config_->MacBytesNumPerframe(Direction::kUplink);
+      ul_data_syms_buffer_dim1 *
+      config_->MacParams().MaxPacketBytes(Direction::kUplink);
   ul_bits_buffer_.Malloc(config_->UeAntNum(), ul_bits_buffer_size_,
                          Agora_memory::Alignment_t::kAlign64);
   ul_bits_buffer_status_.Calloc(config_->UeAntNum(), kFrameWnd,
                                 Agora_memory::Alignment_t::kAlign64);
 
-  // Temp -- Using more memory than necessary to comply with the DoEncode
-  // function which uses the total number of ul symbols offset (instead of
-  // just the data specific ones) ul_syms_buffer_size_ =
-  //    kFrameWnd * ul_symbol_perframe_ * config_->OfdmDataNum();
-  // ul_syms_buffer_.Calloc(config_->UeAntNum(), ul_syms_buffer_size_,
-  //                       Agora_memory::Alignment_t::kAlign64);
-  const size_t ul_syms_buffer_dim1 = ul_symbol_perframe_ * kFrameWnd;
-  const size_t ul_syms_buffer_dim2 =
+  const size_t encoded_buffer_dim2 =
       Roundup<64>(config_->OfdmDataNum()) * config_->UeAntNum();
 
-  ul_syms_buffer_.Calloc(ul_syms_buffer_dim1, ul_syms_buffer_dim2,
+  encoded_buffer_.Calloc(ul_data_syms_buffer_dim1, encoded_buffer_dim2,
                          Agora_memory::Alignment_t::kAlign64);
 
   // initialize modulation buffer
-  modul_buffer_.Calloc(ul_syms_buffer_dim1,
+  modul_buffer_.Calloc(ul_data_syms_buffer_dim1,
                        config_->OfdmDataNum() * config_->UeAntNum(),
                        Agora_memory::Alignment_t::kAlign64);
 
@@ -934,7 +899,7 @@ void PhyUe::InitializeUplinkBuffers() {
 void PhyUe::FreeUplinkBuffers() {
   ul_bits_buffer_.Free();
   ul_bits_buffer_status_.Free();
-  ul_syms_buffer_.Free();
+  encoded_buffer_.Free();
   modul_buffer_.Free();
   ifft_buffer_.Free();
 
@@ -1242,9 +1207,6 @@ void PhyUe::FrameInit(size_t frame) {
     initial |= static_cast<std::uint8_t>(FrameTasksFlags::kDownlinkComplete);
   }
 
-  if ((kEnableMac == false) || (config_->Frame().NumDLSyms() == 0)) {
-    initial |= static_cast<std::uint8_t>(FrameTasksFlags::kMacTxComplete);
-  }
   frame_tasks_.at(frame % kFrameWnd) = initial;
 }
 

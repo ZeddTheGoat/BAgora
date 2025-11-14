@@ -29,7 +29,7 @@ static constexpr size_t kSockBufSize = (1024 * 1024 * 64 * 8) - 1;
 /* Helper classes */
 class SocketRxBuffer {
  public:
-  explicit SocketRxBuffer(size_t num_bytes) : data_size_(0), data_(num_bytes) {}
+  explicit SocketRxBuffer(size_t num_bytes) : data_(num_bytes) {}
   ~SocketRxBuffer() = default;
 
   inline size_t DataSize() const { return data_size_; }
@@ -57,14 +57,14 @@ class SocketRxBuffer {
   }
 
  private:
-  size_t data_size_;
+  size_t data_size_{0};
   SimdAlignByteVector data_;
 };
 
 ChannelSim::ChannelSim(const Config* const config, size_t bs_thread_num,
                        size_t user_thread_num, size_t worker_thread_num,
                        size_t in_core_offset, std::string in_chan_type,
-                       double in_chan_snr)
+                       std::string dataset_path)
     : cfg_(config),
       bs_thread_num_(bs_thread_num),
       user_thread_num_(user_thread_num),
@@ -73,17 +73,18 @@ ChannelSim::ChannelSim(const Config* const config, size_t bs_thread_num,
       worker_thread_num_(worker_thread_num),
       core_offset_(in_core_offset),
       channel_type_(std::move(in_chan_type)),
-      channel_snr_(in_chan_snr) {
+      dataset_path_(std::move(dataset_path)) {
   // initialize parameters from config
+
   ::srand(time(nullptr));
-  dl_data_plus_beacon_symbols_ =
-      cfg_->Frame().NumDLSyms() + cfg_->Frame().NumBeaconSyms();
+  dl_data_plus_bcast_symbols_ =
+      cfg_->Frame().NumDLSyms() + cfg_->Frame().NumDlBcastSyms();
   ul_data_plus_pilot_symbols_ =
       cfg_->Frame().NumULSyms() + cfg_->Frame().NumPilotSyms();
 
   rx_buffer_bs_ = std::make_unique<ChSimRxBuffer>(
-      ChSimRxBuffer::ChSimRxType::kRxTypeBeaconDl, cfg_, kFrameWnd,
-      dl_data_plus_beacon_symbols_, cfg_->BsAntNum(), cfg_->PacketLength());
+      ChSimRxBuffer::ChSimRxType::kRxTypeBcastDl, cfg_, kFrameWnd,
+      dl_data_plus_bcast_symbols_, cfg_->BsAntNum(), cfg_->PacketLength());
 
   rx_buffer_ue_ = std::make_unique<ChSimRxBuffer>(
       ChSimRxBuffer::ChSimRxType::kRxTypePilotUl, cfg_, kFrameWnd,
@@ -93,7 +94,7 @@ ChannelSim::ChannelSim(const Config* const config, size_t bs_thread_num,
   ue_comm_.resize(user_socket_num_);
 
   task_queue_bs_ = moodycamel::ConcurrentQueue<EventData>(
-      kFrameWnd * dl_data_plus_beacon_symbols_ * cfg_->BsAntNum() *
+      kFrameWnd * dl_data_plus_bcast_symbols_ * cfg_->BsAntNum() *
       kDefaultQueueSize);
   task_queue_user_ = moodycamel::ConcurrentQueue<EventData>(
       kFrameWnd * ul_data_plus_pilot_symbols_ * cfg_->UeAntNum() *
@@ -104,7 +105,7 @@ ChannelSim::ChannelSim(const Config* const config, size_t bs_thread_num,
   payload_length_ = cfg_->PacketLength() - Packet::kOffsetOfData;
 
   // Initialize channel
-  channel_ = std::make_unique<Channel>(cfg_, channel_type_, channel_snr_);
+  channel_ = std::make_unique<Channel>(cfg_, channel_type_, dataset_path_);
 
   for (size_t i = 0; i < worker_thread_num_; i++) {
     task_ptok_.at(i) =
@@ -118,8 +119,8 @@ ChannelSim::ChannelSim(const Config* const config, size_t bs_thread_num,
   }
 
   ue_rx_.Init(ul_data_plus_pilot_symbols_, cfg_->UeAntNum());
-  ue_tx_.Init(dl_data_plus_beacon_symbols_);
-  bs_rx_.Init(dl_data_plus_beacon_symbols_, cfg_->BsAntNum());
+  ue_tx_.Init(dl_data_plus_bcast_symbols_);
+  bs_rx_.Init(dl_data_plus_bcast_symbols_, cfg_->BsAntNum());
   bs_tx_.Init(ul_data_plus_pilot_symbols_);
 }
 
@@ -173,7 +174,7 @@ void ChannelSim::Run() {
         case EventType::kPacketRX: {
           const size_t frame_id = gen_tag_t(event.tags_[0u]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0u]).symbol_id_;
-          auto symbol_type = cfg_->GetSymbolType(symbol_id);
+          auto symbol_type = cfg_->Frame().GetSymbolType(symbol_id);
           AGORA_LOG_TRACE("(Frame %zu, Symbol %zu, Ant %d): Rx Data\n",
                           frame_id, symbol_id,
                           gen_tag_t(event.tags_[0u]).ant_id_);
@@ -181,6 +182,7 @@ void ChannelSim::Run() {
           switch (symbol_type) {
             //Rx from base station
             case SymbolType::kBeacon:
+            case SymbolType::kControl:
             case SymbolType::kDL: {
               const bool last_antenna =
                   bs_rx_.CompleteTask(frame_id, symbol_id);
@@ -203,7 +205,7 @@ void ChannelSim::Run() {
                   AGORA_LOG_INFO(
                       "(Frame %zu): Finished downlink reception    of %zu "
                       "symbols in %.3fmS\n",
-                      frame_id, dl_data_plus_beacon_symbols_,
+                      frame_id, dl_data_plus_bcast_symbols_,
                       bs_rx_.GetTaskTotalTimeMs(frame_id));
                 }
               }
@@ -249,7 +251,7 @@ void ChannelSim::Run() {
         case EventType::kPacketTX: {
           const size_t frame_id = gen_tag_t(event.tags_[0u]).frame_id_;
           const size_t symbol_id = gen_tag_t(event.tags_[0u]).symbol_id_;
-          auto symbol_type = cfg_->GetSymbolType(symbol_id);
+          auto symbol_type = cfg_->Frame().GetSymbolType(symbol_id);
           AGORA_LOG_TRACE(
               "(Frame %zu, Symbol %zu, Ant %d): Tx Data all antennas\n",
               frame_id, symbol_id, gen_tag_t(event.tags_[0u]).ant_id_);
@@ -257,6 +259,7 @@ void ChannelSim::Run() {
           switch (symbol_type) {
             //Tx to ue
             case SymbolType::kBeacon:
+            case SymbolType::kControl:
             case SymbolType::kDL: {
               const bool last_symbol = ue_tx_.CompleteTask(frame_id);
               AGORA_LOG_SYMBOL(
@@ -271,7 +274,7 @@ void ChannelSim::Run() {
                   AGORA_LOG_INFO(
                       "(Frame %zu): Finished downlink transmission of %zu "
                       "symbols in %.3fmS (rx to tx), %.3fmS (tx to tx)\n",
-                      frame_id, dl_data_plus_beacon_symbols_,
+                      frame_id, dl_data_plus_bcast_symbols_,
                       (GetTime::GetTimeUs() -
                        bs_rx_.GetTaskEndTimeUs(frame_id)) /
                           1000.0f,

@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "logger.h"
 
@@ -14,11 +15,9 @@ static constexpr size_t kMaxRxAttempts = 25u;
 //Receive on all addresses
 static const std::string kRxAddress = "";
 
-VideoReceiver::VideoReceiver(uint16_t port)
-    : udp_video_receiver_(kRxAddress, port,
-                          VideoReceiver::kVideoStreamSocketRxBufSize),
-      data_available_(0),
-      data_start_offset_(0) {}
+VideoReceiver::VideoReceiver(std::string addr, uint16_t port)
+    : udp_video_receiver_(std::move(addr), port,
+                          VideoReceiver::kVideoStreamSocketRxBufSize) {}
 
 size_t VideoReceiver::Load(unsigned char *destination, size_t requested_bytes) {
   size_t rx_attempts = 0u;
@@ -47,7 +46,8 @@ size_t VideoReceiver::Load(unsigned char *destination, size_t requested_bytes) {
             "[VideoReceiver] Received packet larger than max receive size -- "
             "inspect");
       } else if (rcv_ret > 0) {
-        AGORA_LOG_INFO("[VideoReceiver] data received: %zd\n", rcv_ret);
+        AGORA_LOG_INFO("[VideoReceiver] data received: %zd at port %s\n",
+                       rcv_ret, udp_video_receiver_.Port().c_str());
       }
       data_available_ += rcv_ret;
     }
