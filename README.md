@@ -33,11 +33,16 @@ Some highlights:
      * Note for developers: You must run this command before checking out your new feature branch. Do not use `_` in your branch name. Use `-` instead.  
     
   * See `scripts/ubuntu.sh` for required packages, including Linux packages, gtest, Armadillo, and SoapySDR, and the corresponding versions. Run `./scripts/ubuntu.sh` to install these packages.
-  * Download and install Intel libraries:
+  * If Intel's compiler + MKL toolchain is unavailable, install the open-source dependencies that back the portable FFT/BLAS implementation:
+    <pre>
+    sudo apt-get install libopenblas-dev libfftw3-dev libboost-all-dev libsoapysdr-dev
+    </pre>
+  * The radio calibration utility (`calibrate`) is optional and requires Python headers plus NumPy.  Install `python3-dev python3-numpy` and reconfigure CMake with `-DENABLE_CALIBRATE=ON` when you need this tool.
+  * Download and install Intel libraries (optional when the open-source stack above is installed):
      * Install Intel compiler and MKL, refer to [INTELLIB_README.md](INTELLIB_README.md).
 
      * Set required environment variables by sourcing `setvars.sh`. If oneAPI is installed in `/opt`,
-     run `source /opt/intel/oneapi/setvars.sh`.   
+     run `source /opt/intel/oneapi/setvars.sh`.
 
      * Install [Intel FlexRAN's FEC SDK](https://software.intel.com/en-us/articles/flexran-lte-and-5g-nr-fec-software-development-kit-modules) for LDPC encoding and decoding:
         * **NOTE**: Compiling FlexRAN requires Intel compiler with version <= 19.0.4.
@@ -46,11 +51,11 @@ Some highlights:
         * Download Intel FlexRAN's FEC SDK to `/opt`.
         * Compile FlexRAN as follows:
         <pre>
-        $ sudo chmod -R a+rwX FlexRAN-FEC-SDK-19-04/ # Allow all users read-write access 
-        $ cd /opt/FlexRAN-FEC-SDK-19-04/sdk/ 
-        $ sed -i '/add_compile_options("-Wall")/a \ \ add_compile_options("-ffreestanding")' cmake/intel-compile-options.cmake 
-        $ ./create-makefiles-linux.sh 
-        $ cd build-avx512-icc # or build-avx2-icc 
+        $ sudo chmod -R a+rwX FlexRAN-FEC-SDK-19-04/ # Allow all users read-write access
+        $ cd /opt/FlexRAN-FEC-SDK-19-04/sdk/
+        $ sed -i '/add_compile_options("-Wall")/a \ \ add_compile_options("-ffreestanding")' cmake/intel-compile-options.cmake
+        $ ./create-makefiles-linux.sh
+        $ cd build-avx512-icc # or build-avx2-icc
         $ make -j
         </pre>
 

@@ -5,6 +5,7 @@
  */
 #include "ue_worker.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
 
@@ -649,8 +650,8 @@ void UeWorker::DoIfft(size_t tag) {
           &modul_buffer_[total_ul_data_symbol_id]
                         [ant_id * config_.OfdmDataNum()];
       complex_float* ifft_buff = ifft_buffer_[buff_offset];
-      std::memset(ifft_buff, 0u,
-                  sizeof(complex_float) * config_.OfdmDataStart());
+      std::fill(ifft_buff, ifft_buff + config_.OfdmDataStart(),
+                complex_float{0.0f, 0.0f});
       std::memcpy(ifft_buff + config_.OfdmDataStart(), modul_buff,
                   config_.OfdmDataNum() * sizeof(complex_float));
       if (kDebugTxData) {
@@ -678,8 +679,9 @@ void UeWorker::DoIfft(size_t tag) {
               config_.OfdmDataNum());
         }
       }
-      std::memset(ifft_buff + config_.OfdmDataStop(), 0,
-                  sizeof(complex_float) * config_.OfdmDataStart());
+      std::fill(ifft_buff + config_.OfdmDataStop(),
+                ifft_buff + config_.OfdmDataStop() + config_.OfdmDataStart(),
+                complex_float{0.0f, 0.0f});
 
       if (bypass_ifft == false) {
         CommsLib::FFTShift(ifft_buff, config_.OfdmCaNum());

@@ -1,7 +1,9 @@
 #ifndef SYMBOLS_H_
 #define SYMBOLS_H_
 
+#ifdef AGORA_HAVE_MKL
 #include <mkl.h>
+#endif
 
 #include <array>
 #include <cstddef>
