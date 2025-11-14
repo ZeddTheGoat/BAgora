@@ -366,7 +366,7 @@ void* Sender::WorkerThread(int tid) {
       "this worker %zu\n",
       tid, radio_lo, radio_hi, radios_this_worker);
 
-  DFTI_DESCRIPTOR_HANDLE mkl_handle;
+  DFTI_DESCRIPTOR_HANDLE mkl_handle = nullptr;
   DftiCreateDescriptor(&mkl_handle, DFTI_SINGLE, DFTI_COMPLEX, 1,
                        cfg_->OfdmCaNum());
   DftiCommitDescriptor(mkl_handle);

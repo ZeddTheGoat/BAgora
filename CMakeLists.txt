@@ -102,6 +102,7 @@ message(STATUS "\n-- ----- Configuration values -----")
 message(STATUS "DEBUG:            ${DEBUG}")
 set(RADIO_TYPE SIMULATION CACHE STRING "RADIO_TYPE defaulting to 'SIMULATION', valid types are SIMULATION / SOAPY_IRIS / PURE_UHD")
 message(STATUS "RADIO_TYPE:       ${RADIO_TYPE}")
+set(PYTHON_LIB "")
 set(LOG_LEVEL "info" CACHE STRING "Console logging level (none/error/warn/info/frame/subframe/trace)") 
 message(STATUS "LOG_LEVEL:        ${LOG_LEVEL}")
 set(USE_SPDLOG True CACHE BOOL "USE_SPDLOG set to true to use the spdlog library for logging support")
@@ -156,9 +157,49 @@ if(NOT ENABLE_NUMA)
 endif()
 
 # Intel MKL (threaded Intel10_64lp: Non-threaded Intel10_64lp_seq)
-set(BLA_VENDOR Intel10_64lp_seq)
-find_package(BLAS REQUIRED)
-include_directories(${BLAS_INCLUDE_DIR})
+# Prefer Intel's sequential MKL when available but gracefully fall back to any
+# BLAS implementation (e.g., OpenBLAS) so the project can build on systems
+# without MKL.
+set(BLA_VENDOR Intel10_64lp_seq CACHE STRING "Preferred BLAS vendor")
+find_package(BLAS)
+if(NOT BLAS_FOUND)
+  message(WARNING "Requested BLAS vendor '${BLA_VENDOR}' not found; retrying with generic search")
+  unset(BLA_VENDOR CACHE)
+  find_package(BLAS REQUIRED)
+endif()
+if(BLAS_INCLUDE_DIR)
+  include_directories(${BLAS_INCLUDE_DIR})
+endif()
+
+set(MKL_LIBS "")
+set(FFTW3F_LIBRARIES "")
+set(HAVE_MKL FALSE)
+option(USE_MKL_DFTI "Use Intel MKL for FFT/IFFT routines" ON)
+if(USE_MKL_DFTI)
+  find_path(MKL_INCLUDE_DIR mkl_dfti.h
+    HINTS $ENV{MKLROOT}/include /opt/intel/mkl/include /opt/intel/oneapi/mkl/latest/include)
+  find_library(MKL_RT_LIB mkl_rt
+    HINTS $ENV{MKLROOT}/lib /opt/intel/mkl/lib/intel64 /opt/intel/oneapi/mkl/latest/lib/intel64)
+  if(MKL_INCLUDE_DIR AND MKL_RT_LIB)
+    message(STATUS "Found Intel MKL: ${MKL_RT_LIB}")
+    include_directories(${MKL_INCLUDE_DIR})
+    set(MKL_LIBS ${MKL_RT_LIB} pthread m dl)
+    add_definitions(-DAGORA_HAVE_MKL)
+    set(HAVE_MKL TRUE)
+  else()
+    message(WARNING "Intel MKL not found; FFT/IFFT will fall back to FFTW3f")
+  endif()
+endif()
+
+if(NOT HAVE_MKL)
+  find_path(FFTW3F_INCLUDE_DIR fftw3.h)
+  find_library(FFTW3F_LIB fftw3f)
+  if(NOT FFTW3F_INCLUDE_DIR OR NOT FFTW3F_LIB)
+    message(FATAL_ERROR "FFTW3 single-precision library (libfftw3f) not found. Install libfftw3-dev or provide MKL.")
+  endif()
+  include_directories(${FFTW3F_INCLUDE_DIR})
+  set(FFTW3F_LIBRARIES ${FFTW3F_LIB})
+endif()
 
 # DPDK
 if(ENABLE_DPDK)
@@ -208,20 +249,21 @@ if (${ENABLE_HDF5})
 endif()
 
 #Soapy (optional based on radio type)
+set(AGORA_CALIBRATE_PYTHON_INCLUDES "")
+set(AGORA_CALIBRATE_PYTHON_LIBS "")
+set(AGORA_BUILD_CALIBRATE FALSE)
+set(ENABLE_CALIBRATE_DEFAULT OFF)
+if(RADIO_TYPE STREQUAL SOAPY_IRIS)
+  set(ENABLE_CALIBRATE_DEFAULT ON)
+endif()
+option(ENABLE_CALIBRATE "Build the radio calibration utility" ${ENABLE_CALIBRATE_DEFAULT})
+
 if(RADIO_TYPE STREQUAL SOAPY_IRIS)
   #Python
   find_package(PythonLibs REQUIRED)
   set(PYTHON_LIB ${PYTHON_LIBRARIES})
   include_directories(${PYTHON_INCLUDE_DIRS})
   message(VERBOSE "  PythonLibs Includes: ${PYTHON_INCLUDE_DIRS} Libraries: ${PYTHON_LIBRARIES}")
-
-  find_package(SoapySDR "0.8.0" CONFIG)
-  if(NOT SoapySDR_FOUND)
-    message(FATAL_ERROR "SoapySDR development files not found")
-  endif()
-  set(SOAPY_LIB ${SoapySDR_LIBRARIES})
-  include_directories(${SOAPY_INCLUDE_DIRS})
-  message(VERBOSE "  SoapySDR Includes: ${SoapySDR_INCLUDE_DIRS} Libraries: ${SoapySDR_LIBRARIES}")
 
   set(RADIO_SOURCES
       src/radio/radio.cc
@@ -244,6 +286,43 @@ if(RADIO_TYPE STREQUAL SOAPY_IRIS)
       src/client/txrx/packet_txrx_client_radio.cc
       src/client/txrx/workers/txrx_worker_client_hw.cc
       )
+
+  if(ENABLE_CALIBRATE)
+    find_package(Python3 COMPONENTS Interpreter NumPy QUIET)
+    if(Python3_NumPy_FOUND)
+      set(AGORA_CALIBRATE_PYTHON_INCLUDES ${PYTHON_INCLUDE_DIRS})
+      list(APPEND AGORA_CALIBRATE_PYTHON_INCLUDES ${Python3_NumPy_INCLUDE_DIRS})
+      set(AGORA_CALIBRATE_PYTHON_LIBS ${PYTHON_LIBRARIES})
+      set(AGORA_BUILD_CALIBRATE TRUE)
+    else()
+      message(WARNING "Calibrate target requires NumPy headers; install python3-numpy or re-run with -DENABLE_CALIBRATE=OFF")
+    endif()
+  endif()
+elseif(ENABLE_CALIBRATE)
+  find_package(Python3 COMPONENTS Development NumPy QUIET)
+  if(Python3_Development_FOUND AND Python3_NumPy_FOUND)
+    set(AGORA_CALIBRATE_PYTHON_INCLUDES ${Python3_INCLUDE_DIRS})
+    list(APPEND AGORA_CALIBRATE_PYTHON_INCLUDES ${Python3_NumPy_INCLUDE_DIRS})
+    set(AGORA_CALIBRATE_PYTHON_LIBS ${Python3_LIBRARIES})
+    set(AGORA_BUILD_CALIBRATE TRUE)
+  else()
+    message(STATUS "Python development headers with NumPy not found; calibrate target will be skipped")
+  endif()
+endif()
+
+set(NEED_SOAPY FALSE)
+if(RADIO_TYPE STREQUAL SOAPY_IRIS OR RADIO_TYPE STREQUAL SIMULATION)
+  set(NEED_SOAPY TRUE)
+endif()
+
+if(NEED_SOAPY)
+  find_package(SoapySDR "0.8.0" CONFIG)
+  if(NOT SoapySDR_FOUND)
+    message(FATAL_ERROR "SoapySDR development files not found")
+  endif()
+  set(SOAPY_LIB ${SoapySDR_LIBRARIES})
+  include_directories(${SOAPY_INCLUDE_DIRS})
+  message(VERBOSE "  SoapySDR Includes: ${SoapySDR_INCLUDE_DIRS} Libraries: ${SoapySDR_LIBRARIES}")
 endif()
 
 #SPDLOG
@@ -326,14 +405,21 @@ message(VERBOSE "  gflags: Includes ${GFLAGS_INCLUDE_DIR} Libraries: ${GFLAGS_LI
 include_directories(${GFLAGS_INCLUDE_DIR})
 
 #Flexran
-include_directories(
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_common
-  ${SOURCE_DIR}/src/encoder)
+set(FLEXRAN_LDPC_LIBS "")
+set(FLEXRAN_LDPC_INCLUDE_DIRS "")
+set(FLEXRAN_ENCODER_LIB ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr/libldpc_encoder_5gnr.a)
+set(FLEXRAN_COMMON_LIB ${FLEXRAN_FEC_LIB_DIR}/install/lib_common/libcommon.a)
+if(EXISTS ${FLEXRAN_ENCODER_LIB} AND EXISTS ${FLEXRAN_COMMON_LIB})
+  message(STATUS "Found FlexRAN LDPC encoder libraries under ${FLEXRAN_FEC_LIB_DIR}")
+  set(FLEXRAN_LDPC_LIBS ${FLEXRAN_ENCODER_LIB} ${FLEXRAN_COMMON_LIB})
+  set(FLEXRAN_LDPC_INCLUDE_DIRS
+    ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr
+    ${FLEXRAN_FEC_LIB_DIR}/install/lib_common)
+else()
+  message(STATUS "FlexRAN LDPC encoder not found; using Agora's built-in implementation")
+endif()
 
-set(FLEXRAN_LDPC_LIBS
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr/libldpc_encoder_5gnr.a
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_common/libcommon.a)
+include_directories(${FLEXRAN_LDPC_INCLUDE_DIRS} ${SOURCE_DIR}/src/encoder)
 
 # Unit tests
 enable_testing()
@@ -463,6 +549,11 @@ set(COMMON_SOURCES
   src/common/framestats.cc
   src/agora/doencode.cc
   src/common/mac_utils.cc
+  src/mac/mac_scheduler.cc
+  src/mac/schedulers/scheduler_model.cc
+  src/mac/schedulers/custom_schedule.cc
+  src/mac/schedulers/proportional_fairness.cc
+  src/mac/schedulers/round_robbin.cc
   src/common/utils.cc
   src/common/config.cc
   src/common/fivegconfig.cc
@@ -489,8 +580,10 @@ set(COMMON_SOURCES
   src/encoder/cyclic_shift.cc
   src/encoder/encoder.cc
   src/encoder/iobuffer.cc
+  src/encoder/phy_ldpc_encoder_5gnr.cc
   src/common/ldpc_sb_decoder.cc
-  src/common/phy_ldpc_decoder_5gnr.cc)
+  src/common/phy_ldpc_decoder_5gnr.cc
+  src/data_generator/data_generator.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
 
 list(APPEND COMMON_SOURCES
@@ -542,7 +635,7 @@ set(CLIENT_SOURCES
   src/mac/mac_thread_client.cc)
 add_library(client_sources_lib OBJECT ${CLIENT_SOURCES})
 
-set(COMMON_LIBS -Wl,--start-group ${MKL_LIBS} ${BLAS_LIBRARIES} -Wl,--end-group ${NUMA_LIBRARIES} ${FLEXRAN_LDPC_LIBS} ${HDF5_LIBRARIES} ${DPDK_LIBRARIES} ${ARMADILLO_LIBRARIES} ${SOAPY_LIB}
+set(COMMON_LIBS -Wl,--start-group ${MKL_LIBS} ${BLAS_LIBRARIES} ${FFTW3F_LIBRARIES} -Wl,--end-group ${NUMA_LIBRARIES} ${FLEXRAN_LDPC_LIBS} ${HDF5_LIBRARIES} ${DPDK_LIBRARIES} ${ARMADILLO_LIBRARIES} ${SOAPY_LIB}
     ${PYTHON_LIB} ${Boost_LIBRARIES} ${GFLAGS_LIBRARIES} ${UHD_LIBRARIES} ${COMMON_LIBS})
 message(VERBOSE "Common libs: ${COMMON_LIBS}")
 
@@ -557,14 +650,17 @@ add_executable(agora
   $<TARGET_OBJECTS:common_sources_lib>)
 target_link_libraries(agora ${COMMON_LIBS})
 
-add_executable(calibrate
-  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/calibrate_main.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set_calibrate.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_digital.cc
-  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_analog.cc
-  $<TARGET_OBJECTS:common_sources_lib>)
-target_link_libraries(calibrate ${COMMON_LIBS})
-target_compile_definitions(calibrate PRIVATE CALIBRATE)
+if(AGORA_BUILD_CALIBRATE)
+  add_executable(calibrate
+    ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/calibrate_main.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set_calibrate.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_digital.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_analog.cc
+    $<TARGET_OBJECTS:common_sources_lib>)
+  target_link_libraries(calibrate ${COMMON_LIBS} ${AGORA_CALIBRATE_PYTHON_LIBS})
+  target_include_directories(calibrate PRIVATE ${AGORA_CALIBRATE_PYTHON_INCLUDES})
+  target_compile_definitions(calibrate PRIVATE CALIBRATE)
+endif()
 
 add_executable(data_generator
   ${CMAKE_CURRENT_SOURCE_DIR}/src/data_generator/test_vector_generator.cc
@@ -606,15 +702,17 @@ add_executable(chsim
   $<TARGET_OBJECTS:common_sources_lib>)
 target_link_libraries(chsim ${COMMON_LIBS})
 
-add_executable(macuser
-     ${MAC_CLIENT_SOURCES}
-     ${COMMON_SOURCES})
-target_link_libraries(macuser ${COMMON_LIBS})
+if(ENABLE_MAC)
+  add_executable(macuser
+       ${MAC_CLIENT_SOURCES}
+       ${COMMON_SOURCES})
+  target_link_libraries(macuser ${COMMON_LIBS})
 
-add_executable(macbs
-     ${MAC_BS_SOURCES}
-     ${COMMON_SOURCES})
-target_link_libraries(macbs ${COMMON_LIBS})
+  add_executable(macbs
+       ${MAC_BS_SOURCES}
+       ${COMMON_SOURCES})
+  target_link_libraries(macbs ${COMMON_LIBS})
+endif()
 
 if(RADIO_TYPE STREQUAL SOAPY_IRIS)
   add_executable(radio_test
@@ -626,14 +724,6 @@ if(RADIO_TYPE STREQUAL SOAPY_IRIS)
       $<TARGET_OBJECTS:common_sources_lib>)
   target_link_libraries(radio_test ${COMMON_LIBS})
 
-  add_executable(calibrate
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/radio/radio_set/calibrate_main.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/radio/radio_set/radio_set_calibrate.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/radio/radio_set/radio_calibrate_digital.cc
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/radio/radio_set/radio_calibrate_analog.cc
-    $<TARGET_OBJECTS:common_sources_lib>)
-  target_link_libraries(calibrate ${COMMON_LIBS})
-  target_compile_definitions(calibrate PRIVATE CALIBRATE)
 endif()
 
 # End-to-end test
