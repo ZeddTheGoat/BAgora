@@ -327,14 +327,12 @@ include_directories(${GFLAGS_INCLUDE_DIR})
 
 #Flexran
 include_directories(
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_decoder_5gnr
   ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr
   ${FLEXRAN_FEC_LIB_DIR}/install/lib_common
   ${SOURCE_DIR}/src/encoder)
 
 set(FLEXRAN_LDPC_LIBS
   ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_encoder_5gnr/libldpc_encoder_5gnr.a
-  ${FLEXRAN_FEC_LIB_DIR}/install/lib_ldpc_decoder_5gnr/libldpc_decoder_5gnr.a
   ${FLEXRAN_FEC_LIB_DIR}/install/lib_common/libcommon.a)
 
 # Unit tests
