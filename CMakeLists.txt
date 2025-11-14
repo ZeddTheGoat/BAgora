@@ -328,6 +328,20 @@ set(GTEST_LIBRARIES ${GTEST_LIBRARIES} -lpthread)
 #third party libs included in our repo
 include_directories(third_party third_party/spdlog/include third_party/nlohmann/single_include)
 
+# Detect where the radio sources live (upstream Agora recently moved them)
+set(RADIO_SOURCE_DIR "src/agora/radio")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SOURCE_DIR}")
+  set(RADIO_SOURCE_DIR "src/radio")
+endif()
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SOURCE_DIR}/radio.cc")
+  message(FATAL_ERROR "Unable to locate radio sources under ${RADIO_SOURCE_DIR}; "
+                     "expected radio.cc to exist in either src/agora/radio or src/radio")
+endif()
+set(RADIO_SET_SOURCE_DIR "${RADIO_SOURCE_DIR}/radio_set")
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set.cc")
+  message(FATAL_ERROR "Unable to locate radio_set sources under ${RADIO_SET_SOURCE_DIR}")
+endif()
+
 add_definitions(-DTHREADED_INIT)
 
 if(RADIO_TYPE STREQUAL PURE_UHD)
@@ -357,9 +371,9 @@ if(RADIO_TYPE STREQUAL PURE_UHD)
   find_package(Boost "1.65" REQUIRED ${BOOST_REQUIRED_COMPONENTS})
   message(STATUS "Using Boost Version: ${Boost_VERSION}")
 
-  set(RADIO_SOURCES
-      src/radio/radio_set/radio_set_uhd.cc
-      src/radio/radio_uhdsdr.cc
+  set(PUREUHD_SOURCES
+      ${RADIO_SET_SOURCE_DIR}/radio_set_uhd.cc
+      ${RADIO_SOURCE_DIR}/radio_uhdsdr.cc
       )
   set(RADIO_SOURCES_AGORA
       src/agora/txrx/workers/txrx_worker_usrp.cc
@@ -401,6 +415,8 @@ include_directories(
   src/radio
   src/radio/radio_set
   src/agora/
+  ${RADIO_SOURCE_DIR}
+  ${RADIO_SET_SOURCE_DIR}
   src/agora/txrx
   src/agora/txrx/workers
   src/client
@@ -443,20 +459,13 @@ set(COMMON_SOURCES
   src/common/crc.cc
   src/common/memory_manage.cc
   src/common/scrambler.cc
-  src/mac/mac_scheduler.cc
-  src/mac/schedulers/scheduler_model.cc
-  src/mac/schedulers/custom_schedule.cc
-  src/mac/schedulers/round_robbin.cc
-  src/mac/schedulers/proportional_fairness.cc
-  src/common/ldpc_sb_decoder.cc
-  src/common/phy_ldpc_decoder_5gnr.cc
-  src/agora/radio/radio.cc
-  src/agora/radio/radio_soapysdr.cc
-  src/agora/radio/radio_data_plane.cc
-  src/agora/radio/radio_socket.cc
-  src/agora/radio/radio_data_plane_soapy.cc
-  src/agora/radio/radio_data_plane_socket.cc
-  src/agora/radio/radio_set/radio_set.cc
+  ${RADIO_SOURCE_DIR}/radio.cc
+  ${RADIO_SOURCE_DIR}/radio_soapysdr.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane.cc
+  ${RADIO_SOURCE_DIR}/radio_socket.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane_soapy.cc
+  ${RADIO_SOURCE_DIR}/radio_data_plane_socket.cc
+  ${RADIO_SET_SOURCE_DIR}/radio_set.cc
   src/common/ipc/udp_comm.cc
   src/common/ipc/network_utils.cc
   src/common/loggers/csv_logger.cc
@@ -464,7 +473,8 @@ set(COMMON_SOURCES
   src/encoder/cyclic_shift.cc
   src/encoder/encoder.cc
   src/encoder/iobuffer.cc
-  src/data_generator/data_generator.cc)
+  src/common/ldpc_sb_decoder.cc
+  src/common/phy_ldpc_decoder_5gnr.cc)
 add_library(common_sources_lib OBJECT ${COMMON_SOURCES})
 
 list(APPEND COMMON_SOURCES
@@ -497,6 +507,7 @@ set(AGORA_SOURCES ${AGORA_SOURCES}
   src/agora/dodemul.cc
   src/agora/doprecode.cc
   src/agora/dodecode.cc
+  ${RADIO_SET_SOURCE_DIR}/radio_set_bs.cc
   src/mac/mac_thread_basestation.cc
   src/agora/txrx/packet_txrx_sim.cc
   src/agora/txrx/workers/txrx_worker_sim.cc
@@ -529,6 +540,15 @@ add_executable(agora
   $<TARGET_OBJECTS:shared_txrx_sources_lib>
   $<TARGET_OBJECTS:common_sources_lib>)
 target_link_libraries(agora ${COMMON_LIBS})
+
+add_executable(calibrate
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/calibrate_main.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_set_calibrate.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_digital.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/${RADIO_SET_SOURCE_DIR}/radio_calibrate_analog.cc
+  $<TARGET_OBJECTS:common_sources_lib>)
+target_link_libraries(calibrate ${COMMON_LIBS})
+target_compile_definitions(calibrate PRIVATE CALIBRATE)
 
 add_executable(data_generator
   ${CMAKE_CURRENT_SOURCE_DIR}/src/data_generator/test_vector_generator.cc
